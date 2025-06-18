@@ -727,6 +727,12 @@ class OutputScope(PSBTScope):
         return res
 
 
+class TxModifiable:
+    INPUTS = 0b00000001
+    OUTPUTS = 0b00000010
+    SIGHASH_SINGLE = 0b00000100
+
+
 class PSBT(EmbitBase):
     MAGIC = b"psbt\xff"
     # for subclasses
@@ -740,6 +746,7 @@ class PSBT(EmbitBase):
         self.outputs = []
         self.tx_version = None
         self.locktime = None
+        self.tx_modifiable_flags = None
 
         if tx is not None:
             self.parse_tx(tx)
@@ -884,6 +891,9 @@ class PSBT(EmbitBase):
             r += ser_string(stream, b"\x04")
             r += ser_string(stream, compact.to_bytes(len(self.inputs)))
             r += ser_string(stream, b"\x05")
+            if self.tx_modifiable_flags is not None:
+                r += ser_string(stream, b"\x06")
+                r += ser_string(stream, bytes([self.tx_modifiable_flags]))
             r += ser_string(stream, compact.to_bytes(len(self.outputs)))
             r += ser_string(stream, b"\xfb")
             r += ser_string(stream, self.version.to_bytes(4, "little"))
@@ -1067,6 +1077,12 @@ class PSBT(EmbitBase):
         if b"\xfb" in self.unknown:
             self.unknown.pop(b"\xfb", None)
 
+        if b"\x06" in self.unknown:
+            flags_bytes = self.unknown.pop(b"\x06")
+            if len(flags_bytes) != 1:
+                raise PSBTError("PSBT_GLOBAL_TX_MODIFIABLE must be 1 byte")
+            self.tx_modifiable_flags = flags_bytes[0]
+
         for k in list(self.unknown):
             # xpub field
             if k[0] == 0x01:
@@ -1108,9 +1124,6 @@ class PSBT(EmbitBase):
                         self.PSBTOUT_CLS()
                         for _ in range(self._raw_output_count_from_global)
                     ]
-            elif k == b"\x06":
-                if self.version == 2:
-                    self.unknown.pop(k)
 
     def sighash(self, i, sighash=SIGHASH.ALL, **kwargs):
         inp = self.inputs[i]
@@ -1330,13 +1343,64 @@ class PSBT(EmbitBase):
             # check if root itself is included in the script
             if sec in sc.data or pkh in sc.data:
                 sig = root.sign(h)
-                # sig plus sighash flag
                 inp.partial_sigs[rootpub] = sig.serialize() + bytes([inp_sighash])
                 counter += 1
+                # Update tx_modifiable_flags after signature creation
+                if self.version == 2 and self.tx_modifiable_flags is not None:
+                    if not (inp_sighash & SIGHASH.ANYONECANPAY):
+                        self.tx_modifiable_flags &= ~TxModifiable.INPUTS
+                    if (inp_sighash & 0x1F) != SIGHASH.NONE:
+                        self.tx_modifiable_flags &= ~TxModifiable.OUTPUTS
+                    if (inp_sighash & 0x1F) == SIGHASH.SINGLE:
+                        self.tx_modifiable_flags |= TxModifiable.SIGHASH_SINGLE
 
             for prv, pub in derived_keypairs:
                 sig = prv.sign(h)
-                # sig plus sighash flag
                 inp.partial_sigs[pub] = sig.serialize() + bytes([inp_sighash])
                 counter += 1
+                # Update tx_modifiable_flags after signature creation
+                if self.version == 2 and self.tx_modifiable_flags is not None:
+                    if not (inp_sighash & SIGHASH.ANYONECANPAY):
+                        self.tx_modifiable_flags &= ~TxModifiable.INPUTS
+                    if (inp_sighash & 0x1F) != SIGHASH.NONE:
+                        self.tx_modifiable_flags &= ~TxModifiable.OUTPUTS
+                    if (inp_sighash & 0x1F) == SIGHASH.SINGLE:
+                        self.tx_modifiable_flags |= TxModifiable.SIGHASH_SINGLE
         return counter
+
+    def get_tx_modifiable(self):
+        return self.tx_modifiable_flags
+
+    def set_tx_modifiable(self, flags):
+        if self.version != 2:
+            raise PSBTError("GLOBAL_TX_MODIFIABLE only supported in PSBTv2")
+        self.tx_modifiable_flags = flags
+
+    def is_inputs_modifiable(self):
+        if self.version != 2 or self.tx_modifiable_flags is None:
+            return True
+        return bool(self.tx_modifiable_flags & TxModifiable.INPUTS)
+
+    def is_outputs_modifiable(self):
+        if self.version != 2 or self.tx_modifiable_flags is None:
+            return True
+        return bool(self.tx_modifiable_flags & TxModifiable.OUTPUTS)
+
+    def has_sighash_single(self):
+        if self.version != 2 or self.tx_modifiable_flags is None:
+            return False
+        return bool(self.tx_modifiable_flags & TxModifiable.SIGHASH_SINGLE)
+
+    def add_input(self, input_scope):
+        if not self.is_inputs_modifiable():
+            raise PSBTError("Inputs are not modifiable")
+        self.inputs.append(input_scope)
+        if self.version == 2:
+            self._raw_input_count_from_global = len(self.inputs)
+
+    def add_output(self, output_scope):
+        if not self.is_outputs_modifiable():
+            raise PSBTError("Outputs are not modifiable")
+        self.outputs.append(output_scope)
+        if self.version == 2:
+            self._raw_output_count_from_global = len(self.outputs)
