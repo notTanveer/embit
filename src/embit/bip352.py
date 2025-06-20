@@ -9,6 +9,7 @@ TODO:
 from embit import bech32, ec
 from embit.util import secp256k1
 from embit.hashes import tagged_hash
+from typing import Tuple
 
 
 def generate_silent_payment_address(
@@ -51,3 +52,67 @@ def generate_labeled_silent_payment_address(
     return generate_silent_payment_address(
         b_scan.get_public_key(), label_pubkey, network=network, version=version
     )
+
+
+def decode_silent_payment_address(address: str) -> Tuple[ec.PublicKey, ec.PublicKey]:
+    """
+    Decode a silent payment address and return the scan and spend public keys.
+    Silent payment addresses can be longer than 90 characters, so we need custom decoding.
+    """
+    if address.startswith("sp1"):
+        hrp = "sp"
+    elif address.startswith("tsp1"):
+        hrp = "tsp"
+    else:
+        raise ValueError("Invalid silent payment address: unknown HRP")
+
+    # Custom bech32 decode that bypasses the 90-character limit
+    if (any(ord(x) < 33 or ord(x) > 126 for x in address)) or (
+        address.lower() != address and address.upper() != address
+    ):
+        raise ValueError("Invalid silent payment address: invalid characters")
+
+    address = address.lower()
+    pos = address.rfind("1")
+    if pos < 1 or pos + 7 > len(address):
+        raise ValueError("Invalid silent payment address: invalid format")
+
+    if not all(x in bech32.CHARSET for x in address[pos + 1 :]):
+        raise ValueError(
+            "Invalid silent payment address: invalid characters in data part"
+        )
+
+    hrpgot = address[:pos]
+    data = [bech32.CHARSET.find(x) for x in address[pos + 1 :]]
+
+    if hrpgot != hrp:
+        raise ValueError("Invalid silent payment address: HRP mismatch")
+
+    # Verify checksum
+    encoding = bech32.bech32_verify_checksum(hrpgot, data)
+    if encoding is None:
+        raise ValueError("Invalid silent payment address: checksum verification failed")
+
+    if encoding != bech32.Encoding.BECH32M:
+        raise ValueError("Invalid silent payment address: must use bech32m encoding")
+
+    # Remove checksum
+    data = data[:-6]
+
+    # Version should be 0
+    if data[0] != 0:
+        raise ValueError(
+            f"Invalid silent payment address: unsupported version {data[0]}"
+        )
+
+    decoded = bech32.convertbits(data[1:], 5, 8, False)
+    if decoded is None:
+        raise ValueError("Invalid silent payment address: conversion failed")
+
+    try:
+        B_scan = ec.PublicKey.parse(bytes(decoded[:33]))
+        B_spend = ec.PublicKey.parse(bytes(decoded[33:]))
+    except Exception as e:
+        raise ValueError(f"Invalid silent payment address: invalid public keys - {e}")
+
+    return B_scan, B_spend

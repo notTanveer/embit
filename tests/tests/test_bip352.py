@@ -103,3 +103,27 @@ class BIP352Test(TestCase):
             bip352.generate_labeled_silent_payment_address(
                 scan_priv_key, spend_priv_key.get_public_key(), label=1.0
             )
+
+    def test_decode_silent_payment_address(self):
+        """Should decode the silent payment address and return the expected keys"""
+        for test_vector in BASIC_TEST_VECTORS:
+            scan_priv_key = PrivateKey(unhexlify(test_vector["scan_priv_key"]))
+            spend_priv_key = PrivateKey(unhexlify(test_vector["spend_priv_key"]))
+            B_scan, B_spend = bip352.decode_silent_payment_address(
+                test_vector["sp_address"]
+            )
+
+            assert B_scan == scan_priv_key.get_public_key()
+            assert B_spend == spend_priv_key.get_public_key()
+
+        with pytest.raises(ValueError):
+            # Invalid HRP
+            bip352.decode_silent_payment_address(
+                "st1qqgste7k9hx0qftg6qmwlkqtwuy6cycyavzmzj85c6qdfhjdpdjtdgqjuexzk6murw56suy3e0rd2cgqvycxttddwsvgxe2usfpxumr70xc9pkqwv"
+            )
+
+        with pytest.raises(ValueError):
+            # Invalid encoding
+            bip352.decode_silent_payment_address(
+                "sp1qqgste7k9hx0qftg6qmwlkqtwuy6cycyavzmzj85c6qdfhjdpdjtdgqjuexzk6murw56suy3e0rd2cgqvycxttddwsvgxe2usfpxumr70xc9pkqwvm"
+            )
