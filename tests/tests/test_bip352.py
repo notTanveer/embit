@@ -10,6 +10,11 @@ import pytest
 from embit import bip352
 from embit.ec import PrivateKey
 from embit.networks import NETWORKS
+import json
+import os
+from io import BytesIO
+from embit import ec, transaction, script
+from embit.util import secp256k1
 
 
 BASIC_TEST_VECTORS = [
@@ -127,3 +132,90 @@ class BIP352Test(TestCase):
             bip352.decode_silent_payment_address(
                 "sp1qqgste7k9hx0qftg6qmwlkqtwuy6cycyavzmzj85c6qdfhjdpdjtdgqjuexzk6murw56suy3e0rd2cgqvycxttddwsvgxe2usfpxumr70xc9pkqwvm"
             )
+
+    def test_create_silent_payment_outputs(self):
+        """Should create the correct output public keys from the sending test vectors"""
+        __location__ = os.path.realpath(
+            os.path.join(os.getcwd(), os.path.dirname(__file__))
+        )
+        with open(
+            os.path.join(__location__, "data/send_and_receive_test_vectors.json"), "r"
+        ) as f:
+            SEND_AND_RECEIVE_TEST_VECTORS = json.load(f)
+
+        for case in SEND_AND_RECEIVE_TEST_VECTORS:
+            for sending_test in case["sending"]:
+                with self.subTest(
+                    msg=f"{case['comment']} - {sending_test.get('comment', 'send')}"
+                ):
+                    given = sending_test["given"]
+                    expected = sending_test["expected"]
+
+                    input_privkeys = []
+                    prevouts = []
+                    outpoints = []
+
+                    for vin_data in given["vin"]:
+                        privkey = PrivateKey(unhexlify(vin_data["private_key"]))
+                        input_privkeys.append(privkey)
+
+                        prevout = transaction.TransactionOutput(
+                            value=0,  # value not used
+                            script_pubkey=script.Script(
+                                unhexlify(vin_data["prevout"]["scriptPubKey"]["hex"])
+                            ),
+                        )
+                        prevouts.append(prevout)
+
+                        txid = unhexlify(vin_data["txid"])[::-1]
+                        vout = vin_data["vout"]
+                        outpoints.append((txid, vout))
+
+                    recipient_addresses = given["recipients"]
+
+                    # cases where priv keys sum to zero
+                    if not input_privkeys:
+                        outputs = bip352.create_silent_payment_outputs(
+                            input_privkeys, prevouts, outpoints, recipient_addresses
+                        )
+                        self.assertEqual(outputs, [])
+                        self.assertEqual(expected["outputs"], [[]])
+                        continue
+
+                    # check if this is a zero-sum case
+                    sum_secret = b"\x00" * 32
+                    try:
+                        for i, privkey in enumerate(input_privkeys):
+                            secret = privkey.secret
+                            if prevouts[i].script_pubkey.is_p2tr():
+                                pubkey = privkey.get_public_key()
+                                if pubkey.sec()[0] == 0x03:
+                                    secret = secp256k1.ec_privkey_negate(secret)
+                            sum_secret = secp256k1.ec_privkey_add(sum_secret, secret)
+
+                        if sum_secret == b"\x00" * 32:
+                            outputs = bip352.create_silent_payment_outputs(
+                                input_privkeys, prevouts, outpoints, recipient_addresses
+                            )
+                            self.assertEqual(outputs, [])
+                            self.assertEqual(expected["outputs"], [[]])
+                            continue
+                    except:
+                        continue
+
+                    outputs = bip352.create_silent_payment_outputs(
+                        input_privkeys, prevouts, outpoints, recipient_addresses
+                    )
+
+                    output_hex_list = [pubkey.xonly().hex() for pubkey in outputs]
+
+                    found_match = False
+                    for expected_output_set in expected["outputs"]:
+                        if set(output_hex_list) == set(expected_output_set):
+                            found_match = True
+                            break
+
+                    self.assertTrue(
+                        found_match,
+                        f"Generated outputs {output_hex_list} don't match any expected set {expected['outputs']}",
+                    )

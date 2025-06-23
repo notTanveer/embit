@@ -10,6 +10,7 @@ from embit import bech32, ec
 from embit.util import secp256k1
 from embit.hashes import tagged_hash
 from typing import Tuple
+from . import transaction
 
 
 def generate_silent_payment_address(
@@ -116,3 +117,111 @@ def decode_silent_payment_address(address: str) -> Tuple[ec.PublicKey, ec.Public
         raise ValueError(f"Invalid silent payment address: invalid public keys - {e}")
 
     return B_scan, B_spend
+
+
+def create_silent_payment_outputs(
+    input_privkeys: list[ec.PrivateKey],
+    prevouts: list[transaction.TransactionOutput],
+    outpoints: list[tuple[bytes, int]],
+    recipient_addresses: list[str],
+) -> list[ec.PublicKey]:
+    """
+    creates output public keys for given recipients.
+    sender's side of the protocol.
+
+    Args:
+        input_privkeys: Private keys for the inputs being spent
+        prevouts: Previous outputs being spent (for determining P2TR negation)
+        outpoints: List of (txid, vout) tuples for the inputs
+        recipient_addresses: List of silent payment addresses
+
+    Returns:
+        List of unique output public keys to create in the transaction
+    """
+    if len(input_privkeys) != len(prevouts) or len(input_privkeys) != len(outpoints):
+        raise ValueError(
+            "input_privkeys, prevouts, and outpoints must have the same length"
+        )
+
+    if not input_privkeys:
+        return []
+
+    sum_secret = b"\x00" * 32
+    for i, privkey in enumerate(input_privkeys):
+        secret = privkey.secret
+        if prevouts[i].script_pubkey.is_p2tr():
+            pubkey = privkey.get_public_key()
+            if pubkey.sec()[0] == 0x03:  # y is odd
+                secret = secp256k1.ec_privkey_negate(secret)
+        sum_secret = secp256k1.ec_privkey_add(sum_secret, secret)
+
+    if sum_secret == b"\x00" * 32:
+        return []
+
+    a_sum_priv = ec.PrivateKey(sum_secret)
+    A_sum_pub = a_sum_priv.get_public_key()
+
+    recipient_groups = {}
+    for addr in recipient_addresses:
+        B_scan, B_spend = decode_silent_payment_address(addr)
+        scan_key = B_scan.sec()
+        if scan_key not in recipient_groups:
+            recipient_groups[scan_key] = []
+        recipient_groups[scan_key].append((B_scan, B_spend))
+
+    sorted_outpoints = sorted(
+        outpoints, key=lambda o: o[0] + o[1].to_bytes(4, "little")
+    )
+    lowest_outpoint_txid, lowest_outpoint_vout = sorted_outpoints[0]
+    lowest_outpoint_bytes = lowest_outpoint_txid + lowest_outpoint_vout.to_bytes(
+        4, "little"
+    )
+
+    input_hash = tagged_hash(
+        "BIP0352/Inputs", lowest_outpoint_bytes + A_sum_pub.sec(compressed=False)
+    )
+
+    output_pubkeys = []
+    for scan_key, recipients in recipient_groups.items():
+        B_scan = recipients[0][0]
+
+        # ECDH shared secret: input_hash * a_sum * B_scan
+        ecdh_point_1 = secp256k1.ec_pubkey_tweak_mul(B_scan._point, a_sum_priv.secret)
+        if ecdh_point_1 is None:
+            continue
+        ecdh_point_2 = secp256k1.ec_pubkey_tweak_mul(ecdh_point_1, input_hash)
+        if ecdh_point_2 is None:
+            continue
+        ecdh_shared_secret = ec.PublicKey(ecdh_point_2, compressed=False)
+
+        k = 0
+        for _, B_spend in recipients:
+            # tweak: t_k = H("BIP0352/SharedSecret", ecdh_secret || k)
+            t_k_bytes = tagged_hash(
+                "BIP0352/SharedSecret",
+                ecdh_shared_secret.sec() + k.to_bytes(4, "little"),
+            )
+
+            # output pubkey: P_k = B_spend + t_k * G
+            t_k_point = secp256k1.ec_pubkey_create(t_k_bytes)
+            if t_k_point is None:
+                k += 1
+                continue
+
+            P_k_point = secp256k1.ec_pubkey_add(B_spend._point, t_k_point)
+            if P_k_point is None:
+                k += 1
+                continue
+
+            output_pubkeys.append(ec.PublicKey(P_k_point))
+            k += 1
+
+    unique_pubkeys = []
+    seen_xonly = set()
+    for pubkey in output_pubkeys:
+        xonly = pubkey.xonly()
+        if xonly not in seen_xonly:
+            unique_pubkeys.append(pubkey)
+            seen_xonly.add(xonly)
+
+    return unique_pubkeys
