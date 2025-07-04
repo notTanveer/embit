@@ -12,8 +12,7 @@ from embit.ec import PrivateKey
 from embit.networks import NETWORKS
 import json
 import os
-from io import BytesIO
-from embit import ec, transaction, script
+from embit import transaction, script
 from embit.util import secp256k1
 
 
