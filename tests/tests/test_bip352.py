@@ -132,8 +132,8 @@ class BIP352Test(TestCase):
                 "sp1qqgste7k9hx0qftg6qmwlkqtwuy6cycyavzmzj85c6qdfhjdpdjtdgqjuexzk6murw56suy3e0rd2cgqvycxttddwsvgxe2usfpxumr70xc9pkqwvm"
             )
 
-    def test_create_silent_payment_outputs(self):
-        """Should create the correct output public keys from the sending test vectors"""
+    def test_silent_payment_output_generation(self):
+        """Test both output pubkey generation and destination address conversion"""
         __location__ = os.path.realpath(
             os.path.join(os.getcwd(), os.path.dirname(__file__))
         )
@@ -172,12 +172,15 @@ class BIP352Test(TestCase):
 
                     recipient_addresses = given["recipients"]
 
-                    # cases where priv keys sum to zero
                     if not input_privkeys:
                         outputs = bip352.create_silent_payment_outputs(
                             input_privkeys, prevouts, outpoints, recipient_addresses
                         )
+                        addresses = bip352.generate_destination_addresses(
+                            input_privkeys, prevouts, outpoints, recipient_addresses
+                        )
                         self.assertEqual(outputs, [])
+                        self.assertEqual(addresses, [])
                         self.assertEqual(expected["outputs"], [[]])
                         continue
 
@@ -196,16 +199,19 @@ class BIP352Test(TestCase):
                             outputs = bip352.create_silent_payment_outputs(
                                 input_privkeys, prevouts, outpoints, recipient_addresses
                             )
+                            addresses = bip352.generate_destination_addresses(
+                                input_privkeys, prevouts, outpoints, recipient_addresses
+                            )
                             self.assertEqual(outputs, [])
+                            self.assertEqual(addresses, [])
                             self.assertEqual(expected["outputs"], [[]])
                             continue
-                    except:
+                    except Exception:
                         continue
 
                     outputs = bip352.create_silent_payment_outputs(
                         input_privkeys, prevouts, outpoints, recipient_addresses
                     )
-
                     output_hex_list = [pubkey.xonly().hex() for pubkey in outputs]
 
                     found_match = False
@@ -219,81 +225,11 @@ class BIP352Test(TestCase):
                         f"Generated outputs {output_hex_list} don't match any expected set {expected['outputs']}",
                     )
 
-    def test_generate_destination_addresses(self):
-        """Test generating destination taproot addresses from silent payment addresses"""
-        __location__ = os.path.realpath(
-            os.path.join(os.getcwd(), os.path.dirname(__file__))
-        )
-        with open(
-            os.path.join(__location__, "data/send_and_receive_test_vectors.json"), "r"
-        ) as f:
-            SEND_AND_RECEIVE_TEST_VECTORS = json.load(f)
-
-        for case in SEND_AND_RECEIVE_TEST_VECTORS:
-            for sending_test in case["sending"]:
-                with self.subTest(
-                    msg=f"{case['comment']} - {sending_test.get('comment', 'send')} - addresses"
-                ):
-                    given = sending_test["given"]
-                    expected = sending_test["expected"]
-
-                    input_privkeys = []
-                    prevouts = []
-                    outpoints = []
-
-                    for vin_data in given["vin"]:
-                        privkey = PrivateKey(unhexlify(vin_data["private_key"]))
-                        input_privkeys.append(privkey)
-
-                        prevout = transaction.TransactionOutput(
-                            value=0,  # value not used
-                            script_pubkey=script.Script(
-                                unhexlify(vin_data["prevout"]["scriptPubKey"]["hex"])
-                            ),
-                        )
-                        prevouts.append(prevout)
-
-                        txid = unhexlify(vin_data["txid"])[::-1]
-                        vout = vin_data["vout"]
-                        outpoints.append((txid, vout))
-
-                    recipient_addresses = given["recipients"]
-
-                    # Test edge cases
-                    if not input_privkeys:
-                        addresses = bip352.generate_destination_addresses(
-                            input_privkeys, prevouts, outpoints, recipient_addresses
-                        )
-                        self.assertEqual(addresses, [])
-                        continue
-
-                    sum_secret = b"\x00" * 32
-                    try:
-                        for i, privkey in enumerate(input_privkeys):
-                            secret = privkey.secret
-                            if prevouts[i].script_pubkey.is_p2tr():
-                                pubkey = privkey.get_public_key()
-                                if pubkey.sec()[0] == 0x03:
-                                    secret = secp256k1.ec_privkey_negate(secret)
-                            sum_secret = secp256k1.ec_privkey_add(sum_secret, secret)
-
-                        if sum_secret == b"\x00" * 32:
-                            addresses = bip352.generate_destination_addresses(
-                                input_privkeys, prevouts, outpoints, recipient_addresses
-                            )
-                            self.assertEqual(addresses, [])
-                            continue
-                    except:
-                        continue
-
                     addresses = bip352.generate_destination_addresses(
                         input_privkeys, prevouts, outpoints, recipient_addresses
                     )
-                    print(f"Generated addresses: {addresses}")
 
-                    output_pubkeys = bip352.create_silent_payment_outputs(
-                        input_privkeys, prevouts, outpoints, recipient_addresses
-                    )
+                    self.assertEqual(len(addresses), len(outputs))
 
                     address_pubkeys = []
                     for addr in addresses:
@@ -304,18 +240,50 @@ class BIP352Test(TestCase):
                             ]  # Skip OP_1 and push opcode
                             address_pubkeys.append(pubkey_bytes.hex())
 
-                    expected_pubkeys = [
-                        pubkey.xonly().hex() for pubkey in output_pubkeys
-                    ]
-
-                    self.assertEqual(len(addresses), len(expected_pubkeys))
-                    self.assertEqual(set(address_pubkeys), set(expected_pubkeys))
+                    self.assertEqual(set(address_pubkeys), set(output_hex_list))
 
                     for addr in addresses:
                         self.assertTrue(addr.startswith("bc1p"))  # mainnet taproot
                         self.assertEqual(
                             len(addr), 62
                         )  # standard taproot address length
+
+    def test_generate_destination_addresses_network(self):
+        """Test generate_destination_addresses with different networks"""
+        privkey = PrivateKey(
+            unhexlify(
+                "1cd5e8f6b3f29505ed1da7a5806291ebab6491c6a172467e44debe255428a192"
+            )
+        )
+        prevout = transaction.TransactionOutput(
+            value=0,
+            script_pubkey=script.Script(
+                unhexlify("0014" + "1234567890123456789012345678901234567890")
+            ),
+        )
+        outpoint = (
+            unhexlify(
+                "f4184fc596403b9d638783cf57adfe4c75c605f6356fbc91338530e9831e9e16"
+            ),
+            0,
+        )
+        recipient_address = "sp1qqgste7k9hx0qftg6qmwlkqtwuy6cycyavzmzj85c6qdfhjdpdjtdgqjuexzk6murw56suy3e0rd2cgqvycxttddwsvgxe2usfpxumr70xc9pkqwv"
+
+        # Test with both networks
+        mainnet_addresses = bip352.generate_destination_addresses(
+            [privkey], [prevout], [outpoint], [recipient_address], network="main"
+        )
+        testnet_addresses = bip352.generate_destination_addresses(
+            [privkey], [prevout], [outpoint], [recipient_address], network="test"
+        )
+
+        # Verify addresses are generated for both networks
+        self.assertEqual(len(mainnet_addresses), 1)
+        self.assertEqual(len(testnet_addresses), 1)
+
+        # Verify correct network prefixes
+        self.assertTrue(mainnet_addresses[0].startswith("bc1p"))
+        self.assertTrue(testnet_addresses[0].startswith("tb1p"))
 
     def test_generate_destination_addresses_edge_cases(self):
         """Test edge cases for generate_destination_addresses"""
@@ -385,7 +353,6 @@ class BIP352Test(TestCase):
     def test_generate_destination_addresses_consistency(self):
         """Test that generate_destination_addresses is consistent with create_silent_payment_outputs"""
 
-        # Create test data
         privkey1 = PrivateKey(
             unhexlify(
                 "1cd5e8f6b3f29505ed1da7a5806291ebab6491c6a172467e44debe255428a192"
@@ -444,7 +411,6 @@ class BIP352Test(TestCase):
 
         self.assertEqual(len(output_pubkeys), len(destination_addresses))
 
-        # Convert addresses back to pubkeys and compare
         for addr in destination_addresses:
             addr_script = script.Script.from_address(addr)
             self.assertEqual(addr_script.script_type(), "p2tr")

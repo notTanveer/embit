@@ -267,8 +267,8 @@ def generate_destination_addresses(
 
     destination_addresses = []
     for pubkey in output_pubkeys:
-        # p2tr_script = script.Script(b"\x51\x20" + pubkey.xonly())
-        taproot_address = script.p2tr.address(network=NETWORKS[network])
+        p2tr_script = script.Script(b"\x51\x20" + pubkey.xonly())
+        taproot_address = p2tr_script.address(network=NETWORKS[network])
         destination_addresses.append(taproot_address)
 
     return destination_addresses
