@@ -12,6 +12,8 @@ from embit.util import secp256k1
 from embit.hashes import tagged_hash
 from typing import Tuple
 from . import transaction
+from embit import script
+from embit.networks import NETWORKS
 
 
 def generate_silent_payment_address(
@@ -144,8 +146,14 @@ def create_silent_payment_outputs(
     if not input_privkeys:
         return []
 
-    sum_secret = b"\x00" * 32
-    for i, privkey in enumerate(input_privkeys):
+    sum_secret = input_privkeys[0].secret
+    if prevouts[0].script_pubkey.is_p2tr():
+        pubkey = input_privkeys[0].get_public_key()
+        if pubkey.sec()[0] == 0x03:  # y is odd
+            sum_secret = secp256k1.ec_privkey_negate(sum_secret)
+
+    for i in range(1, len(input_privkeys)):
+        privkey = input_privkeys[i]
         secret = privkey.secret
         if prevouts[i].script_pubkey.is_p2tr():
             pubkey = privkey.get_public_key()
@@ -227,3 +235,40 @@ def create_silent_payment_outputs(
             seen_xonly.add(xonly)
 
     return unique_pubkeys
+
+
+def generate_destination_addresses(
+    input_privkeys: list[ec.PrivateKey],
+    prevouts: list[transaction.TransactionOutput],
+    outpoints: list[tuple[bytes, int]],
+    recipient_addresses: list[str],
+    network: str = "main",
+) -> list[str]:
+    """
+    Generate destination taproot addresses from silent payment addresses.
+    This is used by the sender to create the actual on-chain addresses to send to.
+
+    Args:
+        input_privkeys: Private keys for the inputs being spent
+        prevouts: Previous outputs being spent (for determining P2TR negation)
+        outpoints: List of (txid, vout) tuples for the inputs
+        recipient_addresses: List of silent payment addresses
+        network: Network name (e.g., "main", "testnet")
+
+    Returns:
+        List of taproot addresses corresponding to the silent payment addresses
+    """
+    output_pubkeys = create_silent_payment_outputs(
+        input_privkeys, prevouts, outpoints, recipient_addresses
+    )
+
+    if not output_pubkeys:
+        return []
+
+    destination_addresses = []
+    for pubkey in output_pubkeys:
+        # p2tr_script = script.Script(b"\x51\x20" + pubkey.xonly())
+        taproot_address = script.p2tr.address(network=NETWORKS[network])
+        destination_addresses.append(taproot_address)
+
+    return destination_addresses
