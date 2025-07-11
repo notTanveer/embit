@@ -3,14 +3,12 @@ BIP-352: Silent Payments
 see: https://github.com/bitcoin/bips/blob/master/bip-0352.mediawiki
 
 TODO:
-* Implement deriving a destination addr for a given output and recipient SP address.
-* Implement check to determine if a given output is an SP output for a given SP address.
 * Implement signing SP spends (once psbt format is settled).
 """
 from embit import bech32, ec
 from embit.util import secp256k1
 from embit.hashes import tagged_hash
-from typing import Tuple
+from typing import Tuple, List
 from . import transaction
 from embit import script
 from embit.networks import NETWORKS
@@ -119,59 +117,8 @@ def decode_silent_payment_address(address: str) -> Tuple[ec.PublicKey, ec.Public
     return B_scan, B_spend
 
 
-def create_silent_payment_outputs(
-    input_privkeys: list[ec.PrivateKey],
-    prevouts: list[transaction.TransactionOutput],
-    outpoints: list[tuple[bytes, int]],
-    recipient_addresses: list[str],
-) -> list[ec.PublicKey]:
-    """
-    creates output public keys for given recipients.
-    sender's side of the protocol.
-
-    Args:
-        input_privkeys: Private keys for the inputs being spent
-        prevouts: Previous outputs being spent (for determining P2TR negation)
-        outpoints: List of (txid, vout) tuples for the inputs
-        recipient_addresses: List of silent payment addresses
-
-    Returns:
-        List of unique output public keys to create in the transaction
-    """
-    if len(input_privkeys) != len(prevouts) or len(input_privkeys) != len(outpoints):
-        raise ValueError(
-            "input_privkeys, prevouts, and outpoints must have the same length"
-        )
-
-    if not input_privkeys:
-        return []
-
-    sum_secret = input_privkeys[0].secret
-    if prevouts[0].script_pubkey.is_p2tr():
-        pubkey = input_privkeys[0].get_public_key()
-        if pubkey.sec()[0] == 0x03:  # y is odd
-            sum_secret = secp256k1.ec_privkey_negate(sum_secret)
-
-    for i in range(1, len(input_privkeys)):
-        privkey = input_privkeys[i]
-        secret = privkey.secret
-        if prevouts[i].script_pubkey.is_p2tr():
-            pubkey = privkey.get_public_key()
-            if pubkey.sec()[0] == 0x03:  # y is odd
-                secret = secp256k1.ec_privkey_negate(secret)
-        sum_secret = secp256k1.ec_privkey_add(sum_secret, secret)
-
-    if sum_secret == b"\x00" * 32:
-        return []
-
-    a_sum_priv = ec.PrivateKey(sum_secret)
-    A_sum_pub = a_sum_priv.get_public_key()
-
-    # ensure A_sum has even Y coordinate
-    if A_sum_pub.sec()[0] == 0x03:  # odd Y
-        a_sum_priv = ec.PrivateKey(secp256k1.ec_privkey_negate(a_sum_priv.secret))
-        A_sum_pub = a_sum_priv.get_public_key()
-
+def get_input_hash(outpoints: List[Tuple[bytes, int]], A_sum: ec.PublicKey) -> bytes:
+    """compute input hash for silent payment protocol"""
     sorted_outpoints = sorted(
         outpoints, key=lambda o: o[0] + o[1].to_bytes(4, "little")
     )
@@ -180,95 +127,201 @@ def create_silent_payment_outputs(
         4, "little"
     )
 
-    input_hash = tagged_hash(
-        "BIP0352/Inputs", lowest_outpoint_bytes + A_sum_pub.xonly()
-    )
+    return tagged_hash("BIP0352/Inputs", lowest_outpoint_bytes + A_sum.xonly())
 
-    recipient_groups = {}
-    for addr in recipient_addresses:
-        B_scan, B_spend = decode_silent_payment_address(addr)
-        scan_key = B_scan.xonly()
-        if scan_key not in recipient_groups:
-            recipient_groups[scan_key] = []
-        recipient_groups[scan_key].append((B_scan, B_spend))
 
-    output_pubkeys = []
-    for scan_key, recipients in recipient_groups.items():
-        B_scan = recipients[0][0]
-
-        # ECDH shared secret: input_hash * a_sum * B_scan
-        ecdh_point = secp256k1.ec_pubkey_tweak_mul(
-            B_scan._point, secp256k1.ec_privkey_tweak_mul(a_sum_priv.secret, input_hash)
+def generate_destination_address(
+    input_privkeys: List[Tuple[ec.PrivateKey, bool]],
+    outpoints: List[Tuple[bytes, int]],
+    recipient_addresses: List[str],
+    amounts: List[int],
+    network: str = NETWORKS["main"],
+) -> List[transaction.TxOut]:
+    if not input_privkeys or not outpoints or not recipient_addresses:
+        raise ValueError(
+            "Input private keys, outpoints, and recipient addresses are required."
         )
-        if ecdh_point is None:
+
+    if len(recipient_addresses) != len(amounts):
+        raise ValueError("Number of recipient addresses must match number of amounts")
+
+    a_sum = _sum_private_keys(input_privkeys)
+    A_sum = a_sum.get_public_key()
+    input_hash = get_input_hash(outpoints, A_sum)
+    recipient_groups = _group_recipients_by_scan_key(recipient_addresses, amounts)
+
+    outputs = []
+    for group in recipient_groups:
+        group_outputs = _generate_outputs_for_group(a_sum, input_hash, group, network)
+        outputs.extend(group_outputs)
+
+    return outputs
+
+
+def _sum_private_keys(
+    input_privkeys: List[Tuple[ec.PrivateKey, bool]]
+) -> ec.PrivateKey:
+    """Sum private keys, negating x-only keys with odd y-coordinates."""
+    if not input_privkeys:
+        raise ValueError("No private keys provided")
+
+    first_key, is_xonly = input_privkeys[0]
+    if is_xonly:
+        pubkey = first_key.get_public_key()
+        if pubkey.sec()[0] == 0x03:  # odd y-coordinate
+            result_secret = secp256k1.ec_privkey_negate(first_key.secret)
+        else:
+            result_secret = first_key.secret
+    else:
+        result_secret = first_key.secret
+
+    for key, is_xonly in input_privkeys[1:]:
+        key_secret = key.secret
+        if is_xonly:
+            pubkey = key.get_public_key()
+            if pubkey.sec()[0] == 0x03:
+                key_secret = secp256k1.ec_privkey_negate(key_secret)
+
+        result_secret = secp256k1.ec_privkey_add(result_secret, key_secret)
+
+    return ec.PrivateKey(result_secret)
+
+
+def _group_recipients_by_scan_key(addresses: List[str], amounts: List[int]):
+    """Group recipients by their scan public key."""
+    groups = {}
+
+    for i, (address, amount) in enumerate(zip(addresses, amounts)):
+        if not address.startswith("sp1") and not address.startswith("tsp1"):
             continue
-        ecdh_shared_secret = ec.PublicKey(ecdh_point, compressed=True)
 
-        k = 0
-        for _, B_spend in recipients:
-            # tweak: t_k = H("BIP0352/SharedSecret", ecdh_secret_xonly || k)
-            t_k_bytes = tagged_hash(
-                "BIP0352/SharedSecret",
-                ecdh_shared_secret.xonly() + k.to_bytes(4, "little"),
-            )
+        B_scan, B_spend = decode_silent_payment_address(address)
+        scan_key = B_scan.sec()
 
-            t_k_point = secp256k1.ec_pubkey_create(t_k_bytes)
-            if t_k_point is None:
-                k += 1
-                continue
+        if scan_key not in groups:
+            groups[scan_key] = {"B_scan": B_scan, "recipients": []}
 
-            # output pubkey: P_k = B_spend + t_k * G
-            P_k_point = secp256k1.ec_pubkey_add(B_spend._point, t_k_point)
-            if P_k_point is None:
-                k += 1
-                continue
+        groups[scan_key]["recipients"].append(
+            {"B_spend": B_spend, "amount": amount, "index": i}
+        )
 
-            output_pubkeys.append(ec.PublicKey(P_k_point))
-            k += 1
-
-    unique_pubkeys = []
-    seen_xonly = set()
-    for pubkey in output_pubkeys:
-        xonly = pubkey.xonly()
-        if xonly not in seen_xonly:
-            unique_pubkeys.append(pubkey)
-            seen_xonly.add(xonly)
-
-    return unique_pubkeys
+    return list(groups.values())
 
 
-def generate_destination_addresses(
-    input_privkeys: list[ec.PrivateKey],
-    prevouts: list[transaction.TransactionOutput],
-    outpoints: list[tuple[bytes, int]],
-    recipient_addresses: list[str],
-    network: str = "main",
-) -> list[str]:
+def _generate_outputs_for_group(
+    a_sum: ec.PrivateKey,
+    input_hash: bytes,
+    group: dict,
+) -> List[transaction.TxOut]:
+    """Generate outputs for a recipient group (same scan key)."""
+    outputs = []
+
+    ecdh_step1 = secp256k1.ec_privkey_tweak_mul(input_hash, a_sum.secret)
+    ecdh_step1_key = ec.PrivateKey(ecdh_step1)
+
+    B_scan_parsed = secp256k1.ec_pubkey_parse(group["B_scan"].sec())
+    shared_secret = secp256k1.ecdh(B_scan_parsed, ecdh_step1_key.secret)
+
+    for k, recipient in enumerate(group["recipients"]):
+        # t_k = tagged_hash("BIP0352/SharedSecret", shared_secret || ser32(k))
+        k_bytes = k.to_bytes(4, "big")
+        t_k = tagged_hash("BIP0352/SharedSecret", shared_secret + k_bytes)
+
+        # P_mk = t_k * G + B_spend
+        t_k_pubkey = ec.PrivateKey(t_k).get_public_key()
+        B_spend_parsed = secp256k1.ec_pubkey_parse(recipient["B_spend"].sec())
+        P_mk_parsed = secp256k1.ec_pubkey_add(
+            secp256k1.ec_pubkey_parse(t_k_pubkey.sec()), B_spend_parsed
+        )
+        P_mk = ec.PublicKey(secp256k1.ec_pubkey_serialize(P_mk_parsed))
+
+        taproot_script = script.p2tr(P_mk)
+        output = transaction.TransactionOutput(recipient["amount"], taproot_script)
+        outputs.append(output)
+
+    return outputs
+
+
+def create_silent_payment_transaction(
+    utxos: List[dict],
+    targets: List[dict],
+    fee_rate: int,
+    network: str = NETWORKS["main"],
+) -> transaction.Transaction:
     """
-    Generate destination taproot addresses from silent payment addresses.
-    This is used by the sender to create the actual on-chain addresses to send to.
+    Create a transaction with silent payment outputs.
 
     Args:
-        input_privkeys: Private keys for the inputs being spent
-        prevouts: Previous outputs being spent (for determining P2TR negation)
-        outpoints: List of (txid, vout) tuples for the inputs
-        recipient_addresses: List of silent payment addresses
-        network: Network name (e.g., "main", "testnet")
+        utxos: List of UTXO dictionaries with keys:
+               - txid: str
+               - vout: int
+               - value: int (satoshis)
+               - script_pubkey: Script
+               - private_key: PrivateKey
+               - utxo_type: str ("p2wpkh", "p2tr", etc.)
+        targets: List of target dictionaries with keys:
+                - address: str (can be regular or silent payment address)
+                - amount: int (satoshis)
+        fee_rate: int (sats per vbyte)
+        network: str
 
     Returns:
-        List of taproot addresses corresponding to the silent payment addresses
+        Transaction object
     """
-    output_pubkeys = create_silent_payment_outputs(
-        input_privkeys, prevouts, outpoints, recipient_addresses
-    )
+    sp_targets = []
+    regular_targets = []
+    sp_amounts = []
+    regular_amounts = []
 
-    if not output_pubkeys:
-        return []
+    for target in targets:
+        if target["address"].startswith("sp1") or target["address"].startswith("tsp1"):
+            sp_targets.append(target["address"])
+            sp_amounts.append(target["amount"])
+        else:
+            regular_targets.append(target)
+            regular_amounts.append(target["amount"])
 
-    destination_addresses = []
-    for pubkey in output_pubkeys:
-        p2tr_script = script.Script(b"\x51\x20" + pubkey.xonly())
-        taproot_address = p2tr_script.address(network=NETWORKS[network])
-        destination_addresses.append(taproot_address)
+    inputs = []
+    input_privkeys = []
+    outpoints = []
 
-    return destination_addresses
+    for utxo in utxos:
+        txin = transaction.TransactionInput(
+            txid=bytes.fromhex(utxo["txid"]),
+            vout=utxo["vout"],
+            script_sig=script.Script(),  # empty scriptSig for P2WPKH or P2TR
+            sequence=0xFFFFFFFF,
+        )
+        inputs.append(txin)
+        is_xonly = utxo["utxo_type"] == "p2tr"
+        input_privkeys.append((utxo["private_key"], is_xonly))
+        outpoints.append((bytes.fromhex(utxo["txid"]), utxo["vout"]))
+
+    outputs = []
+    for target in regular_targets:
+        script_pubkey = script.Script.from_address(target["address"])
+        output = transaction.TransactionOutput(target["amount"], script_pubkey)
+        outputs.append(output)
+
+    if sp_targets:
+        sp_outputs = generate_destination_address(
+            input_privkeys, outpoints, sp_targets, sp_amounts, network
+        )
+        outputs.extend(sp_outputs)
+
+    tx = transaction.Transaction(version=2, vin=inputs, vout=outputs, locktime=0)
+    estimated_size = len(tx.serialize()) + len(inputs) * 107  # rough estimate
+    required_fee = estimated_size * fee_rate
+
+    total_input = sum(utxo["value"] for utxo in utxos)
+    total_output = sum(target["amount"] for target in targets)
+
+    if total_input < total_output + required_fee:
+        raise ValueError("Insufficient funds")
+
+    change_amount = total_input - total_output - required_fee
+    if change_amount > 546:
+        # scanning is computationally expensive, so we avoid small change outputs
+        pass
+
+    return tx
