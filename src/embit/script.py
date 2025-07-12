@@ -60,6 +60,12 @@ class Script(EmbitBase):
         # unknown type
         return None
 
+    def is_p2tr(self):
+        """
+        Check if the script is a Pay-to-Taproot script.
+        """
+        return self.script_type() == "p2tr"
+
     def write_to(self, stream):
         res = stream.write(compact.to_bytes(len(self.data)))
         res += stream.write(self.data)

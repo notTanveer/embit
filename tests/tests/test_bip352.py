@@ -10,6 +10,17 @@ import pytest
 from embit import bip352
 from embit.ec import PrivateKey
 from embit.networks import NETWORKS
+import os
+import json
+from embit.transaction import (
+    COutPoint,
+    VinInfo,
+    CTxInWitness,
+    deser_txid,
+    get_pubkey_from_input,
+    from_hex,
+)
+from embit.script import Script
 
 
 BASIC_TEST_VECTORS = [
@@ -122,3 +133,66 @@ class BIP352Test(TestCase):
             bip352.decode_silent_payment_address(
                 "sp1qqgste7k9hx0qftg6qmwlkqtwuy6cycyavzmzj85c6qdfhjdpdjtdgqjuexzk6murw56suy3e0rd2cgqvycxttddwsvgxe2usfpxumr70xc9pkqwvm"
             )
+
+    def test_create_silent_payments_outputs(self):
+        """Test silent payment output generation using test vectors"""
+        __location__ = os.path.realpath(
+            os.path.join(os.getcwd(), os.path.dirname(__file__))
+        )
+        with open(
+            os.path.join(__location__, "data/send_and_receive_test_vectors.json"), "r"
+        ) as f:
+            SEND_AND_RECEIVE_TEST_VECTORS = json.load(f)
+
+        for case in SEND_AND_RECEIVE_TEST_VECTORS:
+            for sending_test in case["sending"]:
+                given = sending_test["given"]
+                expected = sending_test["expected"]
+
+                vins = [
+                    VinInfo(
+                        outpoint=COutPoint(
+                            hash=deser_txid(input["txid"]), n=input["vout"]
+                        ),
+                        scriptSig=unhexlify(input["scriptSig"]),
+                        txinwitness=CTxInWitness().deserialize(
+                            from_hex(input["txinwitness"])
+                        ),
+                        prevout=unhexlify(input["prevout"]["scriptPubKey"]["hex"]),
+                        private_key=(unhexlify(input["private_key"])),
+                    )
+                    for input in given["vin"]
+                ]
+
+                input_priv_keys = []
+                input_pub_keys = []
+                for vin in vins:
+                    pubkey = get_pubkey_from_input(vin)
+                    if not pubkey.valid:
+                        continue
+                    input_priv_keys.append(
+                        (
+                            vin.private_key,
+                            Script(vin.prevout).is_p2tr(),
+                        )
+                    )
+                    input_pub_keys.append(pubkey)
+
+                sending_outputs = []
+                if len(input_pub_keys) > 0:
+                    outpoints = [vin.outpoint for vin in vins]
+                    sending_outputs = bip352.create_outputs(
+                        input_priv_keys, outpoints, given["recipients"]
+                    )
+                    # Note: order doesn't matter for creating/finding the outputs. However, different orderings of the recipient addresses
+                    # will produce different generated outputs if sending to multiple silent payment addresses belonging to the
+                    # same sender but with different labels. Because of this, expected["outputs"] contains all possible valid output sets,
+                    # based on all possible permutations of recipient address orderings. Must match exactly one of the possible output sets.
+                    assert any(
+                        set(sending_outputs) == set(lst) for lst in expected["outputs"]
+                    ), "Sending test failed"
+                    print(f"Sending outputs: {sending_outputs}")
+                else:
+                    assert (
+                        sending_outputs == expected["outputs"][0] == []
+                    ), "Sending test failed"
