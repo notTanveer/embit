@@ -14,6 +14,9 @@ from embit import script
 from embit.networks import NETWORKS
 
 
+CURVE_ORDER = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141
+
+
 def generate_silent_payment_address(
     B_scan: ec.PublicKey, B_spend: ec.PublicKey, network: str = "main", version: int = 0
 ) -> str:
@@ -135,8 +138,7 @@ def generate_destination_address(
     outpoints: List[Tuple[bytes, int]],
     recipient_addresses: List[str],
     amounts: List[int],
-    network: str = NETWORKS["main"],
-) -> List[transaction.TxOut]:
+) -> List[transaction.TransactionOutput]:
     if not input_privkeys or not outpoints or not recipient_addresses:
         raise ValueError(
             "Input private keys, outpoints, and recipient addresses are required."
@@ -152,7 +154,7 @@ def generate_destination_address(
 
     outputs = []
     for group in recipient_groups:
-        group_outputs = _generate_outputs_for_group(a_sum, input_hash, group, network)
+        group_outputs = _generate_outputs_for_group(a_sum, input_hash, group)
         outputs.extend(group_outputs)
 
     return outputs
@@ -161,30 +163,23 @@ def generate_destination_address(
 def _sum_private_keys(
     input_privkeys: List[Tuple[ec.PrivateKey, bool]]
 ) -> ec.PrivateKey:
-    """Sum private keys, negating x-only keys with odd y-coordinates."""
-    if not input_privkeys:
-        raise ValueError("No private keys provided")
-
-    first_key, is_xonly = input_privkeys[0]
-    if is_xonly:
-        pubkey = first_key.get_public_key()
-        if pubkey.sec()[0] == 0x03:  # odd y-coordinate
-            result_secret = secp256k1.ec_privkey_negate(first_key.secret)
-        else:
-            result_secret = first_key.secret
-    else:
-        result_secret = first_key.secret
-
-    for key, is_xonly in input_privkeys[1:]:
-        key_secret = key.secret
+    """Sum private keys using integer arithmetic modulo curve order."""
+    total = 0
+    for sk, is_xonly in input_privkeys:
+        sk_int = int.from_bytes(sk.secret, "big")
         if is_xonly:
-            pubkey = key.get_public_key()
-            if pubkey.sec()[0] == 0x03:
-                key_secret = secp256k1.ec_privkey_negate(key_secret)
+            pub = sk.get_public_key()
+            if pub.sec()[0] == 0x03:  # Odd y-coordinate
+                total = (total - sk_int) % CURVE_ORDER
+            else:
+                total = (total + sk_int) % CURVE_ORDER
+        else:
+            total = (total + sk_int) % CURVE_ORDER
 
-        result_secret = secp256k1.ec_privkey_add(result_secret, key_secret)
+    if total == 0:
+        raise ValueError("Sum of private keys is zero, cannot create silent payment")
 
-    return ec.PrivateKey(result_secret)
+    return ec.PrivateKey(total.to_bytes(32, "big"))
 
 
 def _group_recipients_by_scan_key(addresses: List[str], amounts: List[int]):
@@ -212,15 +207,21 @@ def _generate_outputs_for_group(
     a_sum: ec.PrivateKey,
     input_hash: bytes,
     group: dict,
-) -> List[transaction.TxOut]:
-    """Generate outputs for a recipient group (same scan key)."""
-    outputs = []
+) -> List[transaction.TransactionOutput]:
+    """Generate outputs for a recipient group with integer arithmetic."""
+    # Convert to integers for safe multiplication
+    a_int = int.from_bytes(a_sum.secret, "big")
+    h_int = int.from_bytes(input_hash, "big")
+    d_int = (a_int * h_int) % CURVE_ORDER
 
-    ecdh_step1 = secp256k1.ec_privkey_tweak_mul(input_hash, a_sum.secret)
-    ecdh_step1_key = ec.PrivateKey(ecdh_step1)
+    if d_int == 0:
+        raise ValueError("Product of input hash and private key sum is zero")
 
+    d = d_int.to_bytes(32, "big")
     B_scan_parsed = secp256k1.ec_pubkey_parse(group["B_scan"].sec())
-    shared_secret = secp256k1.ecdh(B_scan_parsed, ecdh_step1_key.secret)
+    shared_secret = secp256k1.ecdh(B_scan_parsed, d)
+
+    outputs = []
 
     for k, recipient in enumerate(group["recipients"]):
         # t_k = tagged_hash("BIP0352/SharedSecret", shared_secret || ser32(k))
@@ -228,12 +229,10 @@ def _generate_outputs_for_group(
         t_k = tagged_hash("BIP0352/SharedSecret", shared_secret + k_bytes)
 
         # P_mk = t_k * G + B_spend
-        t_k_pubkey = ec.PrivateKey(t_k).get_public_key()
         B_spend_parsed = secp256k1.ec_pubkey_parse(recipient["B_spend"].sec())
-        P_mk_parsed = secp256k1.ec_pubkey_add(
-            secp256k1.ec_pubkey_parse(t_k_pubkey.sec()), B_spend_parsed
-        )
-        P_mk = ec.PublicKey(secp256k1.ec_pubkey_serialize(P_mk_parsed))
+        P_mk_parsed = secp256k1.ec_pubkey_add(B_spend_parsed, t_k)
+        P_mk_serialized = secp256k1.ec_pubkey_serialize(P_mk_parsed)
+        P_mk = ec.PublicKey.parse(P_mk_serialized)
 
         taproot_script = script.p2tr(P_mk)
         output = transaction.TransactionOutput(recipient["amount"], taproot_script)

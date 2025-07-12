@@ -133,7 +133,7 @@ class BIP352Test(TestCase):
             )
 
     def test_silent_payment_output_generation(self):
-        """Test both output pubkey generation and destination address conversion"""
+        """Test silent payment output generation using test vectors"""
         __location__ = os.path.realpath(
             os.path.join(os.getcwd(), os.path.dirname(__file__))
         )
@@ -147,5 +147,52 @@ class BIP352Test(TestCase):
                 with self.subTest(
                     msg=f"{case['comment']} - {sending_test.get('comment', 'send')}"
                 ):
+                    given = sending_test["given"]
+                    expected = sending_test["expected"]
 
-                    return
+                    input_privkeys = []
+                    outpoints = []
+
+                    for input_data in given["vin"]:
+                        privkey = PrivateKey(unhexlify(input_data["private_key"]))
+                        is_xonly = input_data["prevout"]["scriptPubKey"][
+                            "hex"
+                        ].startswith(
+                            "5120"
+                        )  # p2tr
+                        input_privkeys.append((privkey, is_xonly))
+
+                        txid = unhexlify(input_data["txid"])
+                        vout = input_data["vout"]
+                        outpoints.append((txid, vout))
+
+                    recipients = given["recipients"]
+                    amounts = [100000] * len(recipients)
+
+                    if not input_privkeys:
+                        assert expected["outputs"] == [[]]
+                        continue
+
+                    try:
+                        addresses = bip352.generate_destination_address(
+                            input_privkeys, outpoints, recipients, amounts
+                        )
+
+                        generated_pubkeys = []
+                        for address in addresses:
+                            output = script.address_to_scriptpubkey(address)
+                            if (
+                                len(output.script_pubkey.data) == 34
+                                and output.script_pubkey.data[0] == 0x51
+                            ):
+                                pubkey_bytes = output.script_pubkey.data[2:]
+                                generated_pubkeys.append(pubkey_bytes.hex())
+
+                        assert any(
+                            set(generated_pubkeys) == set(expected_output)
+                            for expected_output in expected["outputs"]
+                        ), f"Generated pubkeys {generated_pubkeys} don't match any expected outputs {expected['outputs']}"
+
+                    except ValueError:
+                        # fail input sum to zero
+                        assert expected["outputs"] == [[]]
