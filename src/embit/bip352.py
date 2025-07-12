@@ -8,13 +8,11 @@ TODO:
 from embit import bech32, ec
 from embit.util import secp256k1
 from embit.hashes import tagged_hash
-from typing import Tuple, List
+from typing import Tuple, List, Dict
 from . import transaction
 from embit import script
 from embit.networks import NETWORKS
-
-
-CURVE_ORDER = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141
+from embit.util.key import ECKey, ECPubKey, SECP256K1_ORDER, SECP256K1
 
 
 def generate_silent_payment_address(
@@ -170,11 +168,11 @@ def _sum_private_keys(
         if is_xonly:
             pub = sk.get_public_key()
             if pub.sec()[0] == 0x03:  # Odd y-coordinate
-                total = (total - sk_int) % CURVE_ORDER
+                total = (total - sk_int) % SECP256K1_ORDER
             else:
-                total = (total + sk_int) % CURVE_ORDER
+                total = (total + sk_int) % SECP256K1_ORDER
         else:
-            total = (total + sk_int) % CURVE_ORDER
+            total = (total + sk_int) % SECP256K1_ORDER
 
     if total == 0:
         raise ValueError("Sum of private keys is zero, cannot create silent payment")
@@ -208,34 +206,185 @@ def _generate_outputs_for_group(
     input_hash: bytes,
     group: dict,
 ) -> List[transaction.TransactionOutput]:
-    """Generate outputs for a recipient group with integer arithmetic."""
-    # Convert to integers for safe multiplication
-    a_int = int.from_bytes(a_sum.secret, "big")
-    h_int = int.from_bytes(input_hash, "big")
-    d_int = (a_int * h_int) % CURVE_ORDER
-
-    if d_int == 0:
-        raise ValueError("Product of input hash and private key sum is zero")
-
-    d = d_int.to_bytes(32, "big")
-    B_scan_parsed = secp256k1.ec_pubkey_parse(group["B_scan"].sec())
-    shared_secret = secp256k1.ecdh(B_scan_parsed, d)
-
+    """Generate outputs for a recipient group."""
     outputs = []
 
+    print("\n--- Debugging _generate_outputs_for_group ---")
+    print(f"a_sum (private key): {a_sum.secret.hex()}")
+    print(f"input_hash: {input_hash.hex()}")
+    print(f"B_scan (public key): {group['B_scan'].sec().hex()}")
+
+    # Following the reference implementation exactly:
+    # ecdh_shared_secret = input_hash * a_sum * B_scan
+
+    # Step 1: Create ECKey objects from the embit types
+    a_sum_key = ECKey()
+    a_sum_key.set(a_sum.secret, True)
+
+    B_scan_key = ECPubKey()
+    B_scan_key.set(group["B_scan"].sec())
+
+    # Step 2: Convert input_hash to an ECKey (treating it as a private key)
+    input_hash_key = ECKey()
+    input_hash_key.set(input_hash, True)
+
+    # Step 3: Compute the shared secret following the reference:
+    # ecdh_shared_secret = input_hash * a_sum * B_scan
+    # This means: (input_hash * a_sum) * B_scan
+
+    # First: input_hash * a_sum (this gives us a new private key)
+    input_hash_int = int.from_bytes(input_hash, "big")
+    a_sum_int = int.from_bytes(a_sum.secret, "big")
+    combined_scalar = (input_hash_int * a_sum_int) % SECP256K1_ORDER
+    combined_key = ECKey()
+    combined_key.set(combined_scalar.to_bytes(32, "big"), True)
+
+    # Second: combined_scalar * B_scan (point multiplication)
+    shared_secret_point = SECP256K1.mul([(B_scan_key.p, combined_scalar)])
+    shared_secret_affine = SECP256K1.affine(shared_secret_point)
+
+    if shared_secret_affine is None:
+        raise ValueError("Failed to compute shared secret")
+
+    # Get uncompressed point bytes (65 bytes) like the reference uses with get_bytes(False)
+    shared_secret_bytes = (
+        bytes([0x04])
+        + shared_secret_affine[0].to_bytes(32, "big")
+        + shared_secret_affine[1].to_bytes(32, "big")
+    )
+
     for k, recipient in enumerate(group["recipients"]):
-        # t_k = tagged_hash("BIP0352/SharedSecret", shared_secret || ser32(k))
+        # t_k = TaggedHash("BIP0352/SharedSecret", shared_secret_bytes || ser32(k))
         k_bytes = k.to_bytes(4, "big")
-        t_k = tagged_hash("BIP0352/SharedSecret", shared_secret + k_bytes)
+        t_k = tagged_hash("BIP0352/SharedSecret", shared_secret_bytes + k_bytes)
 
         # P_mk = t_k * G + B_spend
-        B_spend_parsed = secp256k1.ec_pubkey_parse(recipient["B_spend"].sec())
-        P_mk_parsed = secp256k1.ec_pubkey_add(B_spend_parsed, t_k)
-        P_mk_serialized = secp256k1.ec_pubkey_serialize(P_mk_parsed)
-        P_mk = ec.PublicKey.parse(P_mk_serialized)
+        t_k_key = ECKey()
+        t_k_key.set(t_k, True)
+        t_k_pubkey = t_k_key.get_pubkey()
+
+        B_spend_key = ECPubKey()
+        B_spend_key.set(recipient["B_spend"].sec())
+
+        # Add the points: P_mk = t_k * G + B_spend
+        P_mk_point = SECP256K1.add(t_k_pubkey.p, B_spend_key.p)
+        P_mk_affine = SECP256K1.affine(P_mk_point)
+
+        if P_mk_affine is None:
+            raise ValueError("Failed to compute P_mk")
+
+        # Convert back to compressed format for the final public key
+        P_mk_bytes = bytes([0x02 + (P_mk_affine[1] & 1)]) + P_mk_affine[0].to_bytes(
+            32, "big"
+        )
+        P_mk = ec.PublicKey.parse(P_mk_bytes)
 
         taproot_script = script.p2tr(P_mk)
         output = transaction.TransactionOutput(recipient["amount"], taproot_script)
         outputs.append(output)
 
     return outputs
+
+
+def create_outputs(
+    input_privkeys: List[Tuple[ec.PrivateKey, bool]],
+    outpoints: List[Tuple[bytes, int]],
+    recipients: List[str],
+    hrp: str = "sp",
+) -> List[str]:
+    # Create generator point G
+    G = ECKey()
+    G.set((1).to_bytes(32, "big"), True)
+    G_pubkey = G.get_pubkey()
+
+    negated_keys = []
+    for key, is_xonly in input_privkeys:
+        k = ECKey()
+        k.set(key.secret, True)
+        if is_xonly and k.get_pubkey().get_y() % 2 != 0:
+            k.negate()
+        negated_keys.append(k)
+
+    # Sum the private keys
+    a_sum = ECKey()
+    total = 0
+    for k in negated_keys:
+        total = (total + int.from_bytes(k.get_bytes(), "big")) % SECP256K1_ORDER
+    a_sum.set(total.to_bytes(32, "big"), True)
+
+    if not a_sum.valid:
+        # Input privkeys sum is zero -> fail
+        return []
+
+    # Get A_sum public key
+    A_sum = a_sum.get_pubkey()
+
+    # Compute input hash - need to convert A_sum to ECPubKey for get_bytes(False)
+    A_sum_ecpubkey = ECPubKey()
+    A_sum_ecpubkey.set(A_sum.get_bytes())
+    input_hash = get_input_hash(outpoints, A_sum_ecpubkey)
+
+    silent_payment_groups: Dict[ECPubKey, List[ECPubKey]] = {}
+    for recipient in recipients:
+        B_scan, B_m = decode_silent_payment_address(recipient)
+        # Convert to ECPubKey for comparison
+        B_scan_ecpubkey = ECPubKey()
+        B_scan_ecpubkey.set(B_scan.sec())
+        B_m_ecpubkey = ECPubKey()
+        B_m_ecpubkey.set(B_m.sec())
+
+        if B_scan_ecpubkey in silent_payment_groups:
+            silent_payment_groups[B_scan_ecpubkey].append(B_m_ecpubkey)
+        else:
+            silent_payment_groups[B_scan_ecpubkey] = [B_m_ecpubkey]
+
+    outputs = []
+    for B_scan, B_m_values in silent_payment_groups.items():
+        # Compute ecdh_shared_secret = input_hash * a_sum * B_scan
+        input_hash_key = ECKey()
+        input_hash_key.set(input_hash, True)
+
+        # First: input_hash * a_sum
+        combined_scalar = (
+            int.from_bytes(input_hash, "big") * int.from_bytes(a_sum.get_bytes(), "big")
+        ) % SECP256K1_ORDER
+        combined_key = ECKey()
+        combined_key.set(combined_scalar.to_bytes(32, "big"), True)
+
+        # Second: combined_scalar * B_scan (point multiplication)
+        shared_secret_point = SECP256K1.mul([(B_scan.p, combined_scalar)])
+        shared_secret_affine = SECP256K1.affine(shared_secret_point)
+
+        if shared_secret_affine is None:
+            continue
+
+        # Create ECPubKey for shared secret to use get_bytes(False)
+        shared_secret_ecpubkey = ECPubKey()
+        shared_secret_ecpubkey.p = shared_secret_point
+        shared_secret_ecpubkey.valid = True
+        shared_secret_ecpubkey.compressed = False
+
+        k = 0
+        for B_m in B_m_values:
+            t_k = tagged_hash(
+                "BIP0352/SharedSecret",
+                shared_secret_ecpubkey.get_bytes() + k.to_bytes(4, "big"),
+            )
+
+            # P_km = B_m + t_k * G
+            t_k_key = ECKey()
+            t_k_key.set(t_k, True)
+            t_k_pubkey = t_k_key.get_pubkey()
+
+            P_km_point = SECP256K1.add(B_m.p, t_k_pubkey.p)
+            P_km_affine = SECP256K1.affine(P_km_point)
+
+            if P_km_affine is not None:
+                P_km_ecpubkey = ECPubKey()
+                P_km_ecpubkey.p = P_km_point
+                P_km_ecpubkey.valid = True
+                P_km_ecpubkey.compressed = True
+                outputs.append(P_km_ecpubkey.get_bytes().hex())
+            k += 1
+
+    return list(set(outputs))
