@@ -78,6 +78,16 @@ def modsqrt(a, p):
     return None
 
 
+def int_or_bytes(s):
+    "Convert 32-bytes to int while accepting also int and returning it as is."
+    if isinstance(s, bytes):
+        assert len(s) == 32
+        s = int.from_bytes(s, "big")
+    elif not isinstance(s, int):
+        raise TypeError
+    return s
+
+
 class EllipticCurve:
     def __init__(self, p, a, b):
         """Initialize elliptic curve y^2 = x^3 + a*x + b over GF(p)."""
@@ -253,6 +263,7 @@ SECP256K1_G = (
 )
 SECP256K1_ORDER = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141
 SECP256K1_ORDER_HALF = SECP256K1_ORDER // 2
+NUMS_H = 0x50929B74C1A04954B78B4B6035E97A5E078A5A0F28EC96D547BFEE9ACE803AC0
 
 
 class ECPubKey:
@@ -261,6 +272,16 @@ class ECPubKey:
     def __init__(self):
         """Construct an uninitialized public key"""
         self.valid = False
+
+    def __repr__(self):
+        return self.get_bytes().hex()
+
+    def __eq__(self, other):
+        assert isinstance(other, ECPubKey)
+        return self.get_bytes() == other.get_bytes()
+
+    def __hash__(self):
+        return hash(self.get_bytes())
 
     def set(self, data):
         """Construct a public key from a serialization in compressed or uncompressed format"""
@@ -287,8 +308,22 @@ class ECPubKey:
                 self.compressed = True
             else:
                 self.valid = False
+        elif len(data) == 32:
+            x = int.from_bytes(data[0:32], "big")
+            if SECP256K1.is_x_coord(x):
+                p = SECP256K1.lift_x(x)
+                # Make the Y coordinate odd if required (lift_x always produces
+                # a point with an even Y coordinate).
+                if (p[1] & 1) != (data[32] & 1):
+                    p = SECP256K1.negate(p)
+                self.p = p
+                self.valid = True
+                self.compressed = True
+            else:
+                self.valid = False
         else:
             self.valid = False
+        return self
 
     @property
     def is_compressed(self):
@@ -298,11 +333,19 @@ class ECPubKey:
     def is_valid(self):
         return self.valid
 
-    def get_bytes(self):
+    def get_y(self):
+        return SECP256K1.affine(self.p)[1]
+
+    def get_x(self):
+        return SECP256K1.affine(self.p)[0]
+
+    def get_bytes(self, bip340=True):
         assert self.valid
         p = SECP256K1.affine(self.p)
         if p is None:
             return None
+        if bip340:
+            return bytes(p[0].to_bytes(32, "big"))
         if self.compressed:
             return bytes([0x02 + (p[1] & 1)]) + p[0].to_bytes(32, "big")
         else:
@@ -364,6 +407,116 @@ class ECPubKey:
             return False
         return True
 
+    def verify_schnorr(self, sig, msg):
+        assert len(msg) == 32
+        assert len(sig) == 64
+        assert self.valid
+        r = int.from_bytes(sig[0:32], "big")
+        if r >= SECP256K1_FIELD_SIZE:
+            return False
+        s = int.from_bytes(sig[32:64], "big")
+        if s >= SECP256K1_ORDER:
+            return False
+        e = (
+            int.from_bytes(
+                TaggedHash("BIP0340/challenge", sig[0:32] + self.get_bytes() + msg),
+                "big",
+            )
+            % SECP256K1_ORDER
+        )
+        R = SECP256K1.mul([(SECP256K1_G, s), (self.p, SECP256K1_ORDER - e)])
+        if not SECP256K1.has_even_y(R):
+            return False
+        if ((r * R[2] * R[2]) % SECP256K1_FIELD_SIZE) != R[0]:
+            return False
+        return True
+
+    def __add__(self, other):
+        """Adds two ECPubKey points."""
+        assert isinstance(other, ECPubKey)
+        assert self.valid
+        assert other.valid
+        ret = ECPubKey()
+        ret.p = SECP256K1.add(other.p, self.p)
+        ret.valid = True
+        ret.compressed = self.compressed
+        return ret
+
+    def __radd__(self, other):
+        """Allows this ECPubKey to be added to 0 for sum()"""
+        if other == 0:
+            return self
+        else:
+            return self + other
+
+    def __mul__(self, other):
+        """Multiplies ECPubKey point with a scalar(int/32bytes/ECKey)."""
+        if isinstance(other, ECKey):
+            assert self.valid
+            assert other.secret is not None
+            multiplier = other.secret
+        else:
+            # int_or_bytes checks that other is `int` or `bytes`
+            multiplier = int_or_bytes(other)
+
+        assert multiplier < SECP256K1_ORDER
+        multiplier = multiplier % SECP256K1_ORDER
+        ret = ECPubKey()
+        ret.p = SECP256K1.mul([(self.p, multiplier)])
+        ret.valid = True
+        ret.compressed = self.compressed
+        return ret
+
+    def __rmul__(self, other):
+        """Multiplies a scalar(int/32bytes/ECKey) with an ECPubKey point"""
+        return self * other
+
+    def __sub__(self, other):
+        """Subtract one point from another"""
+        assert isinstance(other, ECPubKey)
+        assert self.valid
+        assert other.valid
+        ret = ECPubKey()
+        ret.p = SECP256K1.add(self.p, SECP256K1.negate(other.p))
+        ret.valid = True
+        ret.compressed = self.compressed
+        return ret
+
+    def tweak_add(self, tweak):
+        assert self.valid
+        t = int_or_bytes(tweak)
+        if t >= SECP256K1_ORDER:
+            return None
+        tweaked = SECP256K1.affine(SECP256K1.mul([(self.p, 1), (SECP256K1_G, t)]))
+        if tweaked is None:
+            return None
+        ret = ECPubKey()
+        ret.p = tweaked
+        ret.valid = True
+        ret.compressed = self.compressed
+        return ret
+
+    def mul(self, data):
+        """Multiplies ECPubKey point with scalar data."""
+        assert self.valid
+        other = ECKey()
+        other.set(data, True)
+        return self * other
+
+    def negate(self):
+        self.p = SECP256K1.affine(SECP256K1.negate(self.p))
+
+
+def rfc6979_nonce(key):
+    """Compute signing nonce using RFC6979."""
+    v = bytes([1] * 32)
+    k = bytes([0] * 32)
+    k = hmac.new(k, v + b"\x00" + key, "sha256").digest()
+    v = hmac.new(k, v, "sha256").digest()
+    k = hmac.new(k, v + b"\x01" + key, "sha256").digest()
+    v = hmac.new(k, v, "sha256").digest()
+    return hmac.new(k, v, "sha256").digest()
+
 
 def generate_privkey():
     """Generate a valid random 32-byte private key."""
@@ -376,23 +529,109 @@ class ECKey:
     def __init__(self):
         self.valid = False
 
+    def __repr__(self):
+        return str(self.secret)
+
+    def __eq__(self, other):
+        assert isinstance(other, ECKey)
+        return self.secret == other.secret
+
+    def __hash__(self):
+        return hash(self.secret)
+
     def set(self, secret, compressed):
         """Construct a private key object with given 32-byte secret and compressed flag."""
-        assert len(secret) == 32
-        secret = int.from_bytes(secret, "big")
+        secret = int_or_bytes(secret)
         self.valid = secret > 0 and secret < SECP256K1_ORDER
         if self.valid:
             self.secret = secret
             self.compressed = compressed
+        return self
 
     def generate(self, compressed=True):
         """Generate a random private key (compressed or uncompressed)."""
         self.set(generate_privkey(), compressed)
+        return self
 
     def get_bytes(self):
         """Retrieve the 32-byte representation of this key."""
         assert self.valid
         return self.secret.to_bytes(32, "big")
+
+    def as_int(self):
+        return self.secret
+
+    def from_int(self, secret, compressed=True):
+        self.valid = secret > 0 and secret < SECP256K1_ORDER
+        if self.valid:
+            self.secret = secret
+            self.compressed = compressed
+
+    def __add__(self, other):
+        """Add key secrets. Returns compressed key."""
+        assert isinstance(other, ECKey)
+        assert other.secret > 0 and other.secret < SECP256K1_ORDER
+        assert self.valid is True
+        ret_data = ((self.secret + other.secret) % SECP256K1_ORDER).to_bytes(32, "big")
+        ret = ECKey()
+        ret.set(ret_data, True)
+        return ret
+
+    def __radd__(self, other):
+        """Allows this ECKey to be added to 0 for sum()"""
+        if other == 0:
+            return self
+        else:
+            return self + other
+
+    def __sub__(self, other):
+        """Subtract key secrets. Returns compressed key."""
+        assert isinstance(other, ECKey)
+        assert other.secret > 0 and other.secret < SECP256K1_ORDER
+        assert self.valid is True
+        ret_data = ((self.secret - other.secret) % SECP256K1_ORDER).to_bytes(32, "big")
+        ret = ECKey()
+        ret.set(ret_data, True)
+        return ret
+
+    def __mul__(self, other):
+        """Multiply a private key by another private key or multiply a public key by a private key. Returns compressed key."""
+        if isinstance(other, ECKey):
+            assert other.secret > 0 and other.secret < SECP256K1_ORDER
+            assert self.valid is True
+            ret_data = ((self.secret * other.secret) % SECP256K1_ORDER).to_bytes(
+                32, "big"
+            )
+            ret = ECKey()
+            ret.set(ret_data, True)
+            return ret
+        elif isinstance(other, ECPubKey):
+            return other * self
+        else:
+            # ECKey().set() checks that other is an `int` or `bytes`
+            assert self.valid
+            second = ECKey().set(other, self.compressed)
+            return self * second
+
+    def __rmul__(self, other):
+        return self * other
+
+    def add(self, data):
+        """Add key to scalar data. Returns compressed key."""
+        other = ECKey()
+        other.set(data, True)
+        return self + other
+
+    def mul(self, data):
+        """Multiply key secret with scalar data. Returns compressed key."""
+        other = ECKey()
+        other.set(data, True)
+        return self * other
+
+    def negate(self):
+        """Negate a private key."""
+        assert self.valid
+        self.secret = SECP256K1_ORDER - self.secret
 
     @property
     def is_valid(self):
@@ -595,3 +834,40 @@ def sign_schnorr(key, msg, aux=None, flip_p=False, flip_r=False):
     return R[0].to_bytes(32, "big") + ((k + e * sec) % SECP256K1_ORDER).to_bytes(
         32, "big"
     )
+
+
+def generate_key_pair(secret=None, compressed=True):
+    """Convenience function to generate a private-public key pair."""
+    d = ECKey()
+    if secret:
+        d.set(secret, compressed)
+    else:
+        d.generate(compressed)
+
+    P = d.get_pubkey()
+    return d, P
+
+
+def generate_bip340_key_pair():
+    """Convenience function to generate a BIP0340 private-public key pair."""
+    d = ECKey()
+    d.generate()
+    P = d.get_pubkey()
+    if P.get_y() % 2 != 0:
+        d.negate()
+        P.negate()
+    return d, P
+
+
+def generate_schnorr_nonce():
+    """Generate a random valid BIP340 nonce.
+
+    See https://github.com/bitcoin/bips/blob/master/bip-0340.mediawiki.
+    This implementation ensures the y-coordinate of the nonce point is even."""
+    kp = random.randrange(1, SECP256K1_ORDER)
+    assert kp != 0
+    R = SECP256K1.affine(SECP256K1.mul([(SECP256K1_G, kp)]))
+    k = kp if R[1] % 2 == 0 else SECP256K1_ORDER - kp
+    k_key = ECKey()
+    k_key.set(k.to_bytes(32, "big"), True)
+    return k_key
