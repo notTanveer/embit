@@ -4,183 +4,8 @@ from . import hashes
 from .base import EmbitBase, EmbitError
 from .script import Script, Witness
 from .misc import const
-from embit.util.key import ECKey, ECPubKey, NUMS_H
-from embit.hashes import hash160
-from io import BytesIO
-import struct
 from binascii import unhexlify
-
-
-def from_hex(hex_string):
-    """Deserialize from a hex string representation (e.g. from RPC)"""
-    return BytesIO(unhexlify(hex_string))
-
-
-def deser_txid(txid: str):
-    # recall that txids are serialized little-endian, but displayed big-endian
-    # this means when converting from a human readable hex txid, we need to first
-    # reverse it before deserializing it
-    dixt = "".join(map(str.__add__, txid[-2::-2], txid[-1::-2]))
-    return unhexlify(dixt)
-
-
-def deser_compact_size(f: BytesIO):
-    view = f.getbuffer()
-    nbytes = view.nbytes
-    view.release()
-    if nbytes == 0:
-        return 0  # end of stream
-
-    nit = struct.unpack("<B", f.read(1))[0]
-    if nit == 253:
-        nit = struct.unpack("<H", f.read(2))[0]
-    elif nit == 254:
-        nit = struct.unpack("<I", f.read(4))[0]
-    elif nit == 255:
-        nit = struct.unpack("<Q", f.read(8))[0]
-    return nit
-
-
-def deser_string(f: BytesIO):
-    nit = deser_compact_size(f)
-    return f.read(nit)
-
-
-def deser_string_vector(f: BytesIO):
-    nit = deser_compact_size(f)
-    r = []
-    for _ in range(nit):
-        t = deser_string(f)
-        r.append(t)
-    return r
-
-
-class COutPoint:
-    __slots__ = (
-        "hash",
-        "n",
-    )
-
-    def __init__(
-        self,
-        hash=b"",
-        n=0,
-    ):
-        self.hash = hash
-        self.n = n
-
-    def serialize(self):
-        r = b""
-        r += self.hash
-        r += struct.pack("<I", self.n)
-        return r
-
-    def deserialize(self, f):
-        self.hash = f.read(32)
-        self.n = struct.unpack("<I", f.read(4))[0]
-
-
-class VinInfo:
-    __slots__ = ("outpoint", "scriptSig", "txinwitness", "prevout", "private_key")
-
-    def __init__(
-        self,
-        outpoint=None,
-        scriptSig=b"",
-        txinwitness=None,
-        prevout=b"",
-        private_key=None,
-    ):
-        if outpoint is None:
-            self.outpoint = COutPoint()
-        else:
-            self.outpoint = outpoint
-        if txinwitness is None:
-            self.txinwitness = CTxInWitness()
-        else:
-            self.txinwitness = txinwitness
-        if private_key is None:
-            self.private_key = ECKey()
-        else:
-            self.private_key = private_key
-        self.scriptSig = scriptSig
-        self.prevout = prevout
-
-
-class CScriptWitness:
-    __slots__ = ("stack",)
-
-    def __init__(self):
-        # stack is a vector of strings
-        self.stack = []
-
-    def is_null(self):
-        return not self.stack
-
-
-class CTxInWitness:
-    __slots__ = ("scriptWitness",)
-
-    def __init__(self):
-        self.scriptWitness = CScriptWitness()
-
-    def deserialize(self, f: BytesIO):
-        self.scriptWitness.stack = deser_string_vector(f)
-        return self
-
-    def is_null(self):
-        return self.scriptWitness.is_null()
-
-
-# this should ideally be in a utils module or script, but for now we keep it here
-def get_pubkey_from_input(vin: VinInfo) -> ECPubKey:
-    prevout_script = Script(vin.prevout)
-    script_type = prevout_script.script_type()
-    witness_stack = vin.txinwitness.scriptWitness.stack if vin.txinwitness else []
-
-    if script_type == "p2pkh":
-        spk_hash = vin.prevout[3:23]  # Extract hash from raw bytes
-        for i in range(len(vin.scriptSig), 32, -1):
-            if i >= 33:
-                pubkey_bytes = vin.scriptSig[i - 33 : i]
-                if hash160(pubkey_bytes) == spk_hash:
-                    pubkey = ECPubKey().set(pubkey_bytes)
-                    if pubkey.valid and pubkey.is_compressed:
-                        return pubkey
-
-    elif script_type == "p2sh":
-        if len(vin.scriptSig) > 1 and witness_stack:
-            pubkey_bytes = witness_stack[-1]
-            pubkey = ECPubKey().set(pubkey_bytes)
-            if pubkey.valid and pubkey.is_compressed:
-                return pubkey
-
-    elif script_type == "p2wpkh" and witness_stack:
-        pubkey_bytes = witness_stack[-1]
-        pubkey = ECPubKey().set(pubkey_bytes)
-        if pubkey.valid and pubkey.is_compressed:
-            return pubkey
-
-    elif script_type == "p2tr":
-        if witness_stack:
-            if len(witness_stack) > 1 and witness_stack[-1][:1] == b"\x50":
-                witness_stack = witness_stack[:-1]  # Remove annex
-
-            if len(witness_stack) > 1:  # Script-path spend
-                control_block = witness_stack[-1]
-                if len(control_block) >= 33 and control_block[1:33] == NUMS_H.to_bytes(
-                    32, "big"
-                ):
-                    return ECPubKey()
-
-            # Key-path spend
-            if len(vin.prevout) >= 34:
-                pubkey_bytes = b"\x02" + vin.prevout[2:]
-                pubkey = ECPubKey().set(pubkey_bytes)
-                if pubkey.valid:
-                    return pubkey
-
-    return ECPubKey()
+from typing import NamedTuple
 
 
 class TransactionError(EmbitError):
@@ -575,3 +400,37 @@ class TransactionOutput(EmbitBase):
         value = int.from_bytes(stream.read(8), "little")
         script_pubkey = Script.read_from(stream)
         return cls(value, script_pubkey)
+
+
+class COutPoint(NamedTuple):
+    txid: bytes  # endianness same as hex string displayed; reverse of tx serialization order
+    out_idx: int
+
+    @classmethod
+    def from_str(cls, s: str) -> "COutPoint":
+        hash_str, idx_str = s.split(":")
+        assert len(hash_str) == 64, f"{hash_str} should be a sha256 hash"
+        return COutPoint(txid=unhexlify(hash_str), out_idx=int(idx_str))
+
+    def __str__(self) -> str:
+        return f"""COutPoint("{self.to_str()}")"""
+
+    def __repr__(self):
+        return f"<{str(self)}>"
+
+    def to_str(self) -> str:
+        return f"{self.txid.hex()}:{self.out_idx}"
+
+    def to_json(self):
+        return [self.txid.hex(), self.out_idx]
+
+    def serialize(self) -> bytes:
+        return self.txid[::-1] + int.to_bytes(
+            self.out_idx, length=4, byteorder="little", signed=False
+        )
+
+    def is_coinbase(self) -> bool:
+        return self.txid == bytes(32)
+
+    def short_name(self):
+        return f"{self.txid.hex()[0:10]}:{self.out_idx}"

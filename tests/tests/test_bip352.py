@@ -12,15 +12,7 @@ from embit.ec import PrivateKey
 from embit.networks import NETWORKS
 import os
 import json
-from embit.transaction import (
-    COutPoint,
-    VinInfo,
-    CTxInWitness,
-    deser_txid,
-    get_pubkey_from_input,
-    from_hex,
-)
-from embit.script import Script
+from embit.transaction import COutPoint
 
 
 BASIC_TEST_VECTORS = [
@@ -144,55 +136,56 @@ class BIP352Test(TestCase):
         ) as f:
             SEND_AND_RECEIVE_TEST_VECTORS = json.load(f)
 
+        from embit.script import Script, Witness, get_input_pubkey
+        from io import BytesIO
+
         for case in SEND_AND_RECEIVE_TEST_VECTORS:
             for sending_test in case["sending"]:
                 given = sending_test["given"]
                 expected = sending_test["expected"]
 
-                vins = [
-                    VinInfo(
-                        outpoint=COutPoint(
-                            hash=deser_txid(input["txid"]), n=input["vout"]
-                        ),
-                        scriptSig=unhexlify(input["scriptSig"]),
-                        txinwitness=CTxInWitness().deserialize(
-                            from_hex(input["txinwitness"])
-                        ),
-                        prevout=unhexlify(input["prevout"]["scriptPubKey"]["hex"]),
-                        private_key=(unhexlify(input["private_key"])),
-                    )
-                    for input in given["vin"]
-                ]
+                outpoints: list[COutPoint] = []
+                input_privkeys: list[tuple] = []
 
-                input_priv_keys = []
-                input_pub_keys = []
-                for vin in vins:
-                    pubkey = get_pubkey_from_input(vin)
-                    if not pubkey.valid:
+                for txin in given["vin"]:
+                    outpoints.append(
+                        COutPoint(txid=unhexlify(txin["txid"]), out_idx=txin["vout"])
+                    )
+
+                    spk_hex = txin["prevout"]["scriptPubKey"]["hex"]
+                    spk = Script(unhexlify(spk_hex))
+
+                    wit_hex = txin.get("txinwitness", "") or ""
+                    witness = None
+                    if wit_hex:
+                        try:
+                            witness = Witness.read_from(BytesIO(bytes.fromhex(wit_hex)))
+                        except Exception:
+                            witness = None
+
+                    pub = get_input_pubkey(spk, txin.get("scriptSig", ""), witness)
+                    if not getattr(pub, "valid", False):
                         continue
-                    input_priv_keys.append(
-                        (
-                            vin.private_key,
-                            Script(vin.prevout).is_p2tr(),
-                        )
-                    )
-                    input_pub_keys.append(pubkey)
 
-                sending_outputs = []
-                if len(input_pub_keys) > 0:
-                    outpoints = [vin.outpoint for vin in vins]
-                    sending_outputs = bip352.create_outputs(
-                        input_priv_keys, outpoints, given["recipients"]
-                    )
-                    # Note: order doesn't matter for creating/finding the outputs. However, different orderings of the recipient addresses
-                    # will produce different generated outputs if sending to multiple silent payment addresses belonging to the
-                    # same sender but with different labels. Because of this, expected["outputs"] contains all possible valid output sets,
-                    # based on all possible permutations of recipient address orderings. Must match exactly one of the possible output sets.
-                    assert any(
-                        set(sending_outputs) == set(lst) for lst in expected["outputs"]
-                    ), "Sending test failed"
-                    print(f"Sending outputs: {sending_outputs}")
-                else:
-                    assert (
-                        sending_outputs == expected["outputs"][0] == []
-                    ), "Sending test failed"
+                    is_xonly = spk.is_p2tr()
+                    input_privkeys.append((unhexlify(txin["private_key"]), is_xonly))
+
+                outputs_map = bip352.create_outputs(
+                    input_privkeys=input_privkeys,
+                    outpoints=outpoints,
+                    recipients=given["recipients"],
+                )
+
+                expected_outputs = expected["outputs"]
+
+                actual_outputs = []
+                for recipient, outputs in outputs_map.items():
+                    actual_outputs.extend(outputs)
+
+                self.assertTrue(
+                    any(
+                        set(actual_outputs) == set(expected_set)
+                        for expected_set in expected_outputs
+                    ),
+                    f"Actual outputs {set(actual_outputs)} did not match any expected set {expected_outputs}",
+                )
