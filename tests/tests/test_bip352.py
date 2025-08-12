@@ -9,7 +9,6 @@ from unittest import TestCase
 import pytest
 from embit import bip352
 from embit.ec import PrivateKey
-from embit.networks import NETWORKS
 import os
 import json
 from embit.transaction import COutPoint
@@ -48,25 +47,9 @@ class BIP352Test(TestCase):
             spend_priv_key = PrivateKey(unhexlify(test_vector["spend_priv_key"]))
             scan_priv_key = PrivateKey(unhexlify(test_vector["scan_priv_key"]))
             sp_address = bip352.generate_silent_payment_address(
-                scan_priv_key.get_public_key(), spend_priv_key.get_public_key()
+                scan_priv_key, spend_priv_key.get_public_key()
             )
             assert sp_address == test_vector["sp_address"]
-
-    def test_generate_silent_payment_address_for_network(self):
-        """Test network silent payment addrs should start with "tsp" """
-        test_networks = [k for k in NETWORKS.keys() if k != "main"]
-        scan_pubkey = PrivateKey(
-            unhexlify(BASIC_TEST_VECTORS[0]["spend_priv_key"])
-        ).get_public_key()
-        spend_pubkey = PrivateKey(
-            unhexlify(BASIC_TEST_VECTORS[0]["scan_priv_key"])
-        ).get_public_key()
-
-        for network in test_networks:
-            payment_addr = bip352.generate_silent_payment_address(
-                scan_pubkey, spend_pubkey, network=network
-            )
-            assert payment_addr.startswith("tsp")
 
     def test_generate_labeled_silent_payment_address(self):
         """Should generate the expected labeled silent payment addresses"""
@@ -75,30 +58,24 @@ class BIP352Test(TestCase):
         for label, address in zip(
             LABEL_TEST_VECTORS["labels"], LABEL_TEST_VECTORS["addresses"]
         ):
-            sp_address = bip352.generate_labeled_silent_payment_address(
+            sp_address = bip352.generate_silent_payment_address(
                 scan_priv_key, spend_priv_key.get_public_key(), label
             )
             assert sp_address == address
 
         # Label may also be a string, but the bip does not provide any test vectors
-        bip352.generate_labeled_silent_payment_address(
+        bip352.generate_silent_payment_address(
             scan_priv_key, spend_priv_key.get_public_key(), label="tenant 6102"
         )
 
         # Label may also be passed in as bytes
-        bip352.generate_labeled_silent_payment_address(
+        bip352.generate_silent_payment_address(
             scan_priv_key, spend_priv_key.get_public_key(), label="I am bytes".encode()
         )
 
         with pytest.raises(Exception):
-            # Label is required
-            bip352.generate_labeled_silent_payment_address(
-                scan_priv_key, spend_priv_key.get_public_key()
-            )
-
-        with pytest.raises(Exception):
             # Label must be an int, str, or bytes
-            bip352.generate_labeled_silent_payment_address(
+            bip352.generate_silent_payment_address(
                 scan_priv_key, spend_priv_key.get_public_key(), label=1.0
             )
 

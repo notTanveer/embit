@@ -25,46 +25,38 @@ from binascii import hexlify, unhexlify
 
 
 def generate_silent_payment_address(
-    B_scan: ec.PublicKey, B_spend: ec.PublicKey, network: str = "main", version: int = 0
-) -> str:
-    """
-    Adapted from https://github.com/bitcoin/bips/blob/master/bip-0352/reference.py
-    """
-    data = bech32.convertbits(B_scan.sec() + B_spend.sec(), 8, 5)
-    hrp = "sp" if network == "main" else "tsp"
-    return bech32.bech32_encode(bech32.Encoding.BECH32M, hrp, [version] + data)
-
-
-def generate_labeled_silent_payment_address(
-    b_scan: ec.PrivateKey,
-    B_spend: ec.PublicKey,
-    label,
+    scan_privkey: ec.PrivateKey,
+    spend_pubkey: ec.PublicKey,
+    label: int | str | bytes | None = None,
     network: str = "main",
     version: int = 0,
 ) -> str:
     """
-    The spending key is tweaked with the label to generate a labeled silent payment address.
-    see: https://github.com/bitcoin/bips/blob/master/bip-0352.mediawiki#address-encoding
+    Adapted from https://github.com/bitcoin/bips/blob/master/bip-0352/reference.py
 
-    `label` must be an int, str, or bytes.
+    Generates the recipient's reusable silent payment address for a given:
+        * scanning key (can be PublicKey or PrivateKey)
+        * spending pubkey
+        * optional label for labeled addresses
+
+    if scan_key is a PrivateKey and label is provided, generates a labeled address.
     """
-    if isinstance(label, int):
-        label_bytes = label.to_bytes(4, "big")
-    elif isinstance(label, str):
-        label_bytes = label.encode()
-    elif isinstance(label, bytes):
-        label_bytes = label
-    else:
-        raise Exception("Label must be an int, str, or bytes.")
+    scan_pubkey = scan_privkey.get_public_key()
+    if label is not None:
+        if isinstance(label, int):
+            label = label.to_bytes(4, "big")
+        elif isinstance(label, str):
+            label = label.encode()
+        tweak = tagged_hash("BIP0352/Label", scan_privkey.secret + label)
+        spend_pubkey = ec.PublicKey(
+            secp256k1.ec_pubkey_add(
+                secp256k1.ec_pubkey_parse(spend_pubkey.sec()), tweak
+            )
+        )
 
-    tweak = tagged_hash("BIP0352/Label", b_scan.secret + label_bytes)
-    label_pubkey = ec.PublicKey(
-        secp256k1.ec_pubkey_add(secp256k1.ec_pubkey_parse(B_spend.sec()), tweak)
-    )
-
-    return generate_silent_payment_address(
-        b_scan.get_public_key(), label_pubkey, network=network, version=version
-    )
+    data = bech32.convertbits(scan_pubkey.sec() + spend_pubkey.sec(), 8, 5)
+    hrp = "sp" if network == "main" else "tsp"
+    return bech32.bech32_encode(bech32.Encoding.BECH32M, hrp, [version] + data)
 
 
 # TODO: use the bech32 decode function once the flexible bech32 PR is in
