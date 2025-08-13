@@ -35,11 +35,9 @@ def generate_silent_payment_address(
     Adapted from https://github.com/bitcoin/bips/blob/master/bip-0352/reference.py
 
     Generates the recipient's reusable silent payment address for a given:
-        * scanning key (can be PublicKey or PrivateKey)
-        * spending pubkey
+        * scan private key
+        * spend public key
         * optional label for labeled addresses
-
-    if scan_key is a PrivateKey and label is provided, generates a labeled address.
     """
     scan_pubkey = scan_privkey.get_public_key()
     if label is not None:
