@@ -255,6 +255,7 @@ SECP256K1_G = (
 )
 SECP256K1_ORDER = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141
 SECP256K1_ORDER_HALF = SECP256K1_ORDER // 2
+NUMS_H = 0x50929B74C1A04954B78B4B6035E97A5E078A5A0F28EC96D547BFEE9ACE803AC0
 
 
 class ECPubKey:
@@ -291,6 +292,7 @@ class ECPubKey:
                 self.valid = False
         else:
             self.valid = False
+        return self
 
     @property
     def is_compressed(self):
