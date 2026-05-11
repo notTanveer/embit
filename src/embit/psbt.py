@@ -1333,7 +1333,7 @@ class PSBT(EmbitBase):
             if inp.is_taproot:
                 # try to sign with individual private key (WIF)
                 # or with root without derivations
-                counter += self.sign_input_with_tapkey(
+                tap_sigs = self.sign_input_with_tapkey(
                     root,
                     i,
                     inp,
@@ -1341,12 +1341,15 @@ class PSBT(EmbitBase):
                 )
                 # sign with all derived keys
                 for prv, pub in derived_keypairs:
-                    counter += self.sign_input_with_tapkey(
+                    tap_sigs += self.sign_input_with_tapkey(
                         prv,
                         i,
                         inp,
                         sighash=inp_sighash,
                     )
+                if tap_sigs > 0:
+                    counter += tap_sigs
+                    self._update_tx_modifiable(inp_sighash)
                 continue
 
             # hash can be reused
@@ -1356,13 +1359,80 @@ class PSBT(EmbitBase):
             # check if root itself is included in the script
             if sec in sc.data or pkh in sc.data:
                 sig = root.sign(h)
-                # sig plus sighash flag
                 inp.partial_sigs[rootpub] = sig.serialize() + bytes([inp_sighash])
                 counter += 1
+                self._update_tx_modifiable(inp_sighash)
 
             for prv, pub in derived_keypairs:
                 sig = prv.sign(h)
-                # sig plus sighash flag
                 inp.partial_sigs[pub] = sig.serialize() + bytes([inp_sighash])
                 counter += 1
+                self._update_tx_modifiable(inp_sighash)
+
         return counter
+
+    def _update_tx_modifiable(self, inp_sighash: int) -> None:
+        """
+        Update PSBT_GLOBAL_TX_MODIFIABLE after a signature is added.
+        BIP-370 Signer role: signer must update this field to reflect
+        the constraints imposed by the sighash type used.
+        """
+        if self.version != 2:
+            return
+
+        is_anyonecanpay = bool(inp_sighash & SIGHASH.ANYONECANPAY)
+        sighash_type = inp_sighash & 0x1F
+
+        if self.tx_modifiable_flags is not None:
+            if not is_anyonecanpay:
+                self.tx_modifiable_flags &= ~TxModifiable.INPUTS
+            if sighash_type != SIGHASH.NONE:
+                self.tx_modifiable_flags &= ~TxModifiable.OUTPUTS
+
+        # SIGHASH_SINGLE bit must be set even if field was absent (BIP-370 Signer role)
+        if sighash_type == SIGHASH.SINGLE:
+            if self.tx_modifiable_flags is None:
+                self.tx_modifiable_flags = TxModifiable.SIGHASH_SINGLE
+            else:
+                self.tx_modifiable_flags |= TxModifiable.SIGHASH_SINGLE
+
+    def get_tx_modifiable(self):
+        return self.tx_modifiable_flags
+
+    def set_tx_modifiable(self, flags):
+        if self.version != 2:
+            raise PSBTError("GLOBAL_TX_MODIFIABLE only supported in PSBTv2")
+        self.tx_modifiable_flags = flags
+
+    def is_inputs_modifiable(self):
+        if self.version != 2:
+            return True
+        if self.tx_modifiable_flags is None:
+            return False
+        return bool(self.tx_modifiable_flags & TxModifiable.INPUTS)
+
+    def is_outputs_modifiable(self):
+        if self.version != 2:
+            return True
+        if self.tx_modifiable_flags is None:
+            return False
+        return bool(self.tx_modifiable_flags & TxModifiable.OUTPUTS)
+
+    def has_sighash_single(self):
+        if self.version != 2 or self.tx_modifiable_flags is None:
+            return False
+        return bool(self.tx_modifiable_flags & TxModifiable.SIGHASH_SINGLE)
+
+    def add_input(self, input_scope):
+        if not self.is_inputs_modifiable():
+            raise PSBTError("Inputs are not modifiable")
+        self.inputs.append(input_scope)
+        if self.version == 2:
+            self._raw_input_count_from_global = len(self.inputs)
+
+    def add_output(self, output_scope):
+        if not self.is_outputs_modifiable():
+            raise PSBTError("Outputs are not modifiable")
+        self.outputs.append(output_scope)
+        if self.version == 2:
+            self._raw_output_count_from_global = len(self.outputs)
