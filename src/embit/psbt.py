@@ -362,10 +362,16 @@ class InputScope(PSBTScope):
 
         # PSBTv2 fields
         elif k == b"\x0e":
+            if version != 2:
+                raise PSBTError("PSBT_IN_PREVIOUS_TXID not allowed in PSBTv0")
             self.txid = bytes(reversed(v))
         elif k == b"\x0f":
+            if version != 2:
+                raise PSBTError("PSBT_IN_OUTPUT_INDEX not allowed in PSBTv0")
             self.vout = int.from_bytes(v, "little")
         elif k == b"\x10":
+            if version != 2:
+                raise PSBTError("PSBT_IN_SEQUENCE not allowed in PSBTv0")
             self.sequence = int.from_bytes(v, "little")
 
         # PSBT_IN_REQUIRED_TIME_LOCKTIME
@@ -635,8 +641,18 @@ class OutputScope(PSBTScope):
 
         # PSBTv2 fields
         elif k == b"\x03":
-            self.value = int.from_bytes(v, "little")
+            if version != 2:
+                raise PSBTError("PSBT_OUT_AMOUNT not allowed in PSBTv0")
+            if len(v) != 8:
+                raise PSBTError("PSBT_OUT_AMOUNT must be 8 bytes")
+            if self.value is not None:
+                raise PSBTError("Duplicated PSBT_OUT_AMOUNT")
+            self.value = int.from_bytes(v, "little", signed=True)
         elif k == b"\x04":
+            if version != 2:
+                raise PSBTError("PSBT_OUT_SCRIPT not allowed in PSBTv0")
+            if self.script_pubkey is not None:
+                raise PSBTError("Duplicated PSBT_OUT_SCRIPT")
             self.script_pubkey = Script(v)
 
         # PSBT_OUT_TAP_INTERNAL_KEY
@@ -717,6 +733,12 @@ class OutputScope(PSBTScope):
         return res
 
 
+class TxModifiable:
+    INPUTS = 0b00000001
+    OUTPUTS = 0b00000010
+    SIGHASH_SINGLE = 0b00000100
+
+
 class PSBT(EmbitBase):
     MAGIC = b"psbt\xff"
     # for subclasses
@@ -724,12 +746,28 @@ class PSBT(EmbitBase):
     PSBTOUT_CLS = OutputScope
     TX_CLS = Transaction
 
+    @classmethod
+    def _validate_v2_output(cls, out, i):
+        """Check that a PSBTv2 output has all required fields.
+        Subclasses (e.g. PSET) may override this to accept alternative fields."""
+        if out.value is None:
+            raise PSBTError(
+                f"PSBTv2 output {i} missing required PSBT_OUT_AMOUNT (0x03)"
+            )
+        if out.script_pubkey is None:
+            raise PSBTError(
+                f"PSBTv2 output {i} missing required PSBT_OUT_SCRIPT (0x04)"
+            )
+
     def __init__(self, tx=None, unknown={}, version=None):
-        self.version = version  # None for v0
+        self.version = version  # None for v0, 2 for v2
         self.inputs = []
         self.outputs = []
         self.tx_version = None
         self.locktime = None
+        self.tx_modifiable_flags = None
+        self._raw_input_count_from_global = None
+        self._raw_output_count_from_global = None
 
         if tx is not None:
             self.parse_tx(tx)
@@ -744,11 +782,72 @@ class PSBT(EmbitBase):
         self.inputs = [self.PSBTIN_CLS(vin=vin) for vin in tx.vin]
         self.outputs = [self.PSBTOUT_CLS(vout=vout) for vout in tx.vout]
 
+    def determine_locktime(self):
+        """
+        Determines the appropriate locktime according to PSBTv2 rules.
+        Returns the locktime that should be used for the transaction.
+        """
+        if self.version != 2:
+            return self.locktime or 0
+
+        height_locktimes = []
+        time_locktimes = []
+        inputs_with_locktime_requirements = 0
+
+        for inp in self.inputs:
+            has_requirement = False
+            if inp.required_height_locktime is not None:
+                height_locktimes.append(inp.required_height_locktime)
+                has_requirement = True
+            if inp.required_time_locktime is not None:
+                time_locktimes.append(inp.required_time_locktime)
+                has_requirement = True
+            if has_requirement:
+                inputs_with_locktime_requirements += 1
+
+        # If no inputs have locktime requirements, use fallback
+        if inputs_with_locktime_requirements == 0:
+            return self.locktime or 0
+
+        inputs_supporting_height = 0
+        inputs_supporting_time = 0
+
+        for inp in self.inputs:
+            has_height = inp.required_height_locktime is not None
+            has_time = inp.required_time_locktime is not None
+
+            if not has_height and not has_time:
+                continue
+
+            if has_height:
+                inputs_supporting_height += 1
+            if has_time:
+                inputs_supporting_time += 1
+
+        # height preferred, if ALL inputs with requirements support it
+        if inputs_supporting_height == inputs_with_locktime_requirements:
+            return max(height_locktimes)
+
+        # fall back to time if ALL inputs with requirements support it
+        if inputs_supporting_time == inputs_with_locktime_requirements:
+            return max(time_locktimes)
+
+        raise PSBTError(
+            "Cannot determine locktime: inputs have conflicting height and time locktime requirements"
+        )
+
     @property
     def tx(self):
+        if self.version == 2:
+            locktime = self.determine_locktime()
+        else:
+            locktime = self.locktime or 0
+
+        if self.version == 2 and self.tx_version is None:
+            raise PSBTError("PSBTv2 is missing required PSBT_GLOBAL_TX_VERSION")
         return self.TX_CLS(
             version=self.tx_version or 2,
-            locktime=self.locktime or 0,
+            locktime=locktime,
             vin=[inp.vin for inp in self.inputs],
             vout=[out.vout for out in self.outputs],
         )
@@ -801,9 +900,12 @@ class PSBT(EmbitBase):
             r += ser_string(stream, self.xpubs[xpub].serialize())
 
         if self.version == 2:
-            if self.tx_version is not None:
-                r += ser_string(stream, b"\x02")
-                r += ser_string(stream, self.tx_version.to_bytes(4, "little"))
+            if self.tx_version is None:
+                raise PSBTError(
+                    "Cannot serialize PSBTv2: missing required PSBT_GLOBAL_TX_VERSION"
+                )
+            r += ser_string(stream, b"\x02")
+            r += ser_string(stream, self.tx_version.to_bytes(4, "little"))
             if self.locktime is not None:
                 r += ser_string(stream, b"\x03")
                 r += ser_string(stream, self.locktime.to_bytes(4, "little"))
@@ -811,6 +913,9 @@ class PSBT(EmbitBase):
             r += ser_string(stream, compact.to_bytes(len(self.inputs)))
             r += ser_string(stream, b"\x05")
             r += ser_string(stream, compact.to_bytes(len(self.outputs)))
+            if self.tx_modifiable_flags is not None:
+                r += ser_string(stream, b"\x06")
+                r += ser_string(stream, bytes([self.tx_modifiable_flags]))
             r += ser_string(stream, b"\xfb")
             r += ser_string(stream, self.version.to_bytes(4, "little"))
         # unknown
@@ -855,72 +960,183 @@ class PSBT(EmbitBase):
         without storing them in memory and save the utxo internally for signing.
         This helps against out-of-memory errors.
         """
-        tx = None
-        unknown = {}
-        version = None
-        # check magic
         if stream.read(len(cls.MAGIC)) != cls.MAGIC:
             raise PSBTError("Invalid PSBT magic")
+
+        global_kvs = OrderedDict()
         while True:
             key = read_string(stream)
-            # separator
-            if len(key) == 0:
+            if len(key) == 0:  # Separator
                 break
             value = read_string(stream)
-            # tx
-            if key == b"\x00":
-                if tx is None:
-                    tx = cls.TX_CLS.parse(value)
-                else:
-                    raise PSBTError(
-                        "Failed to parse PSBT - duplicated transaction field"
-                    )
-            elif key == b"\xfb":
-                version = int.from_bytes(value, "little")
-            else:
-                if key in unknown:
-                    raise PSBTError("Duplicated key")
-                unknown[key] = value
+            if key in global_kvs:
+                raise PSBTError(f"Duplicated global key: {hexlify(key).decode()}")
+            global_kvs[key] = value
 
-        if tx and version == 2:
-            raise PSBTError("Global TX field is not allowed in PSBTv2")
-        psbt = cls(tx, unknown, version=version)
-        # input scopes
-        for i, vin in enumerate(psbt.tx.vin):
-            psbt.inputs[i] = cls.PSBTIN_CLS.read_from(
-                stream, compress=compress, vin=vin
-            )
-        # output scopes
-        for i, vout in enumerate(psbt.tx.vout):
-            psbt.outputs[i] = cls.PSBTOUT_CLS.read_from(
-                stream, compress=compress, vout=vout
-            )
+        # Determine PSBT version from PSBT_GLOBAL_VERSION (0xfb)
+        version = None
+        if b"\xfb" in global_kvs:
+            parsed_version = int.from_bytes(global_kvs[b"\xfb"], "little")
+            if parsed_version == 2:
+                version = 2
+            else:
+                raise PSBTError(
+                    f"Unsupported PSBT_GLOBAL_VERSION value: {parsed_version}"
+                )
+
+        if version == 2:  # PSBTv2
+            if b"\x00" in global_kvs:  # PSBT_GLOBAL_UNSIGNED_TX
+                raise PSBTError("PSBT_GLOBAL_UNSIGNED_TX is not allowed in PSBTv2")
+            # Pass all global KVs to unknown; __init__ calls parse_unknowns.
+            psbt = cls(tx=None, unknown=global_kvs, version=version)
+
+            # Validate that input/output counts were processed by parse_unknowns
+            if psbt._raw_input_count_from_global is None:
+                raise PSBTError(
+                    "PSBTv2 missing or invalid PSBT_GLOBAL_INPUT_COUNT (0x04)"
+                )
+            if psbt._raw_output_count_from_global is None:
+                raise PSBTError(
+                    "PSBTv2 missing or invalid PSBT_GLOBAL_OUTPUT_COUNT (0x05)"
+                )
+            if psbt.tx_version is None:
+                raise PSBTError("PSBTv2 missing required PSBT_GLOBAL_TX_VERSION (0x02)")
+        else:  # PSBTv0 (version is None or 0)
+            if b"\x00" not in global_kvs:
+                raise PSBTError("PSBT_GLOBAL_UNSIGNED_TX (0x00) is required for PSBTv0")
+
+            # Check for forbidden v2-only global keys in v0 context
+            # Note: PSBT_GLOBAL_VERSION (0xfb) is not defined in PSBTv0; any occurrence is invalid.
+            v2_only_global_keys = {b"\x02", b"\x03", b"\x04", b"\x05", b"\x06", b"\xfb"}
+            for k_v2_only in v2_only_global_keys:
+                if k_v2_only in global_kvs:
+                    raise PSBTError(
+                        f"Global key {hexlify(k_v2_only).decode()} is not allowed in PSBTv0"
+                    )
+
+            tx_bytes = global_kvs.pop(b"\x00")  # Remove so it's not in unknown
+            tx_for_v0 = cls.TX_CLS.parse(tx_bytes)
+            psbt = cls(tx=tx_for_v0, unknown=global_kvs, version=version)
+
+        if version == 2:
+            num_inputs = psbt._raw_input_count_from_global
+            num_outputs = psbt._raw_output_count_from_global
+
+            parsed_inputs = []
+            for _ in range(num_inputs):
+                parsed_inputs.append(
+                    cls.PSBTIN_CLS.read_from(
+                        stream,
+                        compress=compress,
+                        vin=None,
+                        version=version,
+                    )
+                )
+            psbt.inputs = parsed_inputs
+
+            for i, inp in enumerate(psbt.inputs):
+                if inp.txid is None:
+                    raise PSBTError(
+                        f"PSBTv2 input {i} missing required PSBT_IN_PREVIOUS_TXID (0x0e)"
+                    )
+                if inp.vout is None:
+                    raise PSBTError(
+                        f"PSBTv2 input {i} missing required PSBT_IN_OUTPUT_INDEX (0x0f)"
+                    )
+
+            parsed_outputs = []
+            for _ in range(num_outputs):
+                parsed_outputs.append(
+                    cls.PSBTOUT_CLS.read_from(
+                        stream,
+                        compress=compress,
+                        vout=None,
+                        version=version,
+                    )
+                )
+            psbt.outputs = parsed_outputs
+
+            for i, out in enumerate(psbt.outputs):
+                cls._validate_v2_output(out, i)
+        else:
+            temp_inputs = []
+            for i in range(len(psbt.inputs)):
+                temp_inputs.append(
+                    cls.PSBTIN_CLS.read_from(
+                        stream,
+                        compress=compress,
+                        vin=psbt.inputs[i].vin,
+                        version=version,
+                    )
+                )
+            psbt.inputs = temp_inputs
+
+            temp_outputs = []
+            for i in range(len(psbt.outputs)):
+                temp_outputs.append(
+                    cls.PSBTOUT_CLS.read_from(
+                        stream,
+                        compress=compress,
+                        vout=psbt.outputs[i].vout,
+                        version=version,
+                    )
+                )
+            psbt.outputs = temp_outputs
+
         return psbt
 
     def parse_unknowns(self):
+        # Handle PSBT_GLOBAL_VERSION first
+        if b"\xfb" in self.unknown:
+            self.unknown.pop(b"\xfb", None)
+
+        if b"\x06" in self.unknown:
+            flags_bytes = self.unknown.pop(b"\x06")
+            if len(flags_bytes) != 1:
+                raise PSBTError("PSBT_GLOBAL_TX_MODIFIABLE must be 1 byte")
+            self.tx_modifiable_flags = flags_bytes[0]
+
         for k in list(self.unknown):
             # xpub field
             if k[0] == 0x01:
                 xpub = bip32.HDKey.parse(k[1:])
                 self.xpubs[xpub] = DerivationPath.parse(self.unknown.pop(k))
             elif k == b"\x02":
-                self.tx_version = int.from_bytes(self.unknown.pop(k), "little")
+                if self.version == 2:
+                    v = self.unknown.pop(k)
+                    if len(v) != 4:
+                        raise PSBTError("PSBT_GLOBAL_TX_VERSION must be 4 bytes")
+                    self.tx_version = int.from_bytes(v, "little")
             elif k == b"\x03":
-                self.locktime = int.from_bytes(self.unknown.pop(k), "little")
+                if self.version == 2:
+                    v = self.unknown.pop(k)
+                    if len(v) != 4:
+                        raise PSBTError("PSBT_GLOBAL_FALLBACK_LOCKTIME must be 4 bytes")
+                    self.locktime = int.from_bytes(v, "little")
             elif k == b"\x04":
-                if len(self.inputs) > 0:
-                    raise PSBTError("Inputs already initialized")
-                self.inputs = [
-                    self.PSBTIN_CLS()
-                    for _ in range(compact.from_bytes(self.unknown.pop(k)))
-                ]
+                if self.version == 2:
+                    if self._raw_input_count_from_global is not None:
+                        self.unknown.pop(k, None)
+                        continue
+                    self._raw_input_count_from_global = compact.from_bytes(
+                        self.unknown.pop(k)
+                    )
+                    self.inputs = [
+                        self.PSBTIN_CLS()
+                        for _ in range(self._raw_input_count_from_global)
+                    ]
             elif k == b"\x05":
-                if len(self.outputs) > 0:
-                    raise PSBTError("Outputs already initialized")
-                self.outputs = [
-                    self.PSBTOUT_CLS()
-                    for _ in range(compact.from_bytes(self.unknown.pop(k)))
-                ]
+                if self.version == 2:
+                    if self._raw_output_count_from_global is not None:
+                        self.unknown.pop(k, None)
+                        continue
+                    self._raw_output_count_from_global = compact.from_bytes(
+                        self.unknown.pop(k)
+                    )
+                    self.outputs = [
+                        self.PSBTOUT_CLS()
+                        for _ in range(self._raw_output_count_from_global)
+                    ]
 
     def sighash(self, i, sighash=SIGHASH.ALL, **kwargs):
         inp = self.inputs[i]
