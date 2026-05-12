@@ -13,6 +13,7 @@ where SD card MCU can trick you to sign a wrong transactions.
 
 Makes sense to run gc.collect() after processing of each scope to free memory.
 """
+
 # TODO: refactor, a lot of code is duplicated here from transaction.py
 from collections import OrderedDict
 import hashlib
@@ -26,6 +27,7 @@ from .psbt import (
     CompressMode,
     InputScope,
     OutputScope,
+    TxModifiable,
     read_string,
     ser_string,
     skip_string,
@@ -180,6 +182,10 @@ class PSBTView:
         version=None,
         tx_offset=None,
         compress=CompressMode.KEEP_ALL,
+        tx_modifiable_flags=None,
+        tx_modifiable_inject_at=None,
+        tx_modifiable_kv_start=None,
+        tx_modifiable_kv_end=None,
     ):
         if version != 2 and tx_offset is None:
             raise PSBTError("Global tx is not found, but PSBT version is %d" % version)
@@ -196,6 +202,17 @@ class PSBTView:
         self.compress = compress
         self._tx_version = self.tx.version if self.tx else None
         self._locktime = self.tx.locktime if self.tx else None
+        self.tx_modifiable_flags = tx_modifiable_flags
+        self._had_tx_modifiable = tx_modifiable_flags is not None
+        # Byte offset where TX_MODIFIABLE should be injected (right after the last key < 0x06)
+        self._tx_modifiable_inject_at = (
+            tx_modifiable_inject_at
+            if tx_modifiable_inject_at is not None
+            else first_scope - 1
+        )
+        # Byte range [start, end) of the existing 0x06 kv pair in the stream (None when absent)
+        self._tx_modifiable_kv_start = tx_modifiable_kv_start
+        self._tx_modifiable_kv_end = tx_modifiable_kv_end
         self.clear_cache()
 
     def clear_cache(self):
@@ -222,14 +239,21 @@ class PSBTView:
         num_inputs = None
         num_outputs = None
         tx_offset = None
+        tx_modifiable_flags = None
+        tx_modifiable_kv_start = None
+        tx_modifiable_kv_end = None
+        # Track where TX_MODIFIABLE (key 0x06) should be injected: right after the
+        # last key-value whose first key byte is less than 0x06.
+        tx_modifiable_inject_at = offset + len(cls.MAGIC)
         while True:
             # read key and update cursor
+            before_key_cur = cur
             key = read_string(stream)
             cur += len(key) + len(compact.to_bytes(len(key)))
             # separator
             if len(key) == 0:
                 break
-            if key in [b"\xfb", b"\x04", b"\x05"]:
+            if key in [b"\xfb", b"\x04", b"\x05", b"\x06"]:
                 value = read_string(stream)
                 cur += len(value) + len(compact.to_bytes(len(value)))
                 if key == b"\xfb":
@@ -238,10 +262,14 @@ class PSBTView:
                     num_inputs = compact.from_bytes(value)
                 elif key == b"\x05":
                     num_outputs = compact.from_bytes(value)
+                elif key == b"\x06":
+                    tx_modifiable_flags = int.from_bytes(value, "little")
+                    tx_modifiable_kv_start = before_key_cur
+                    tx_modifiable_kv_end = cur
             elif key == b"\x00":
-                # we found global transaction
-                if version == 2:
-                    raise PSBTError("Global transaction with version 2 PSBT")
+                # we found global transaction; defer version==2 check until after the loop
+                # so that PSBT_GLOBAL_UNSIGNED_TX is rejected even when it appears before
+                # PSBT_GLOBAL_VERSION (key order is not guaranteed).
                 if (num_inputs is not None) or (num_outputs is not None):
                     raise PSBTError("Invalid global transaction")
                 tx_len = compact.read_from(stream)
@@ -255,7 +283,14 @@ class PSBTView:
                 cur += tx_len
             else:
                 cur += skip_string(stream)
+            # Update injection point: TX_MODIFIABLE belongs after all keys whose
+            # first byte is less than 0x06 (i.e. keys 0x00-0x05).
+            if key and key[0] < 0x06:
+                tx_modifiable_inject_at = cur
         first_scope = cur
+        # PSBTv2 must not have a global unsigned transaction, regardless of key order
+        if tx_offset is not None and version == 2:
+            raise PSBTError("Global transaction with version 2 PSBT")
         if None in [version or tx_offset, num_inputs, num_outputs]:
             raise PSBTError("Missing something important in PSBT")
         return cls(
@@ -267,6 +302,10 @@ class PSBTView:
             version,
             tx_offset,
             compress,
+            tx_modifiable_flags,
+            tx_modifiable_inject_at,
+            tx_modifiable_kv_start,
+            tx_modifiable_kv_end,
         )
 
     def _skip_scope(self):
@@ -345,7 +384,7 @@ class PSBTView:
         vout = int.from_bytes(v, "little")
 
         self.seek_to_scope(i)
-        v = self.get_value(b"\x10", from_current=True) or b"\xFF\xFF\xFF\xFF"
+        v = self.get_value(b"\x10", from_current=True) or b"\xff\xff\xff\xff"
         sequence = int.from_bytes(v, "little")
 
         return TransactionInput(txid, vout, sequence=sequence)
@@ -370,15 +409,68 @@ class PSBTView:
     @property
     def locktime(self):
         if self._locktime is None:
-            v = self.get_value(b"\x03")
-            self._locktime = int.from_bytes(v, "little") if v is not None else 0
+            if self.version == 2:
+                self._locktime = self._determine_locktime_v2()
+            else:
+                v = self.get_value(b"\x03")
+                self._locktime = int.from_bytes(v, "little") if v is not None else 0
         return self._locktime
+
+    def _determine_locktime_v2(self):
+        """BIP370 locktime determination for PSBTv2.
+
+        Derives the transaction locktime from per-input required locktime fields.
+        Falls back to PSBT_GLOBAL_FALLBACK_LOCKTIME (or 0) when no input imposes
+        a requirement.
+        """
+        v = self.get_value(b"\x03")
+        fallback = int.from_bytes(v, "little") if v is not None else 0
+
+        height_locktimes = []
+        time_locktimes = []
+        inputs_with_requirements = 0
+
+        for i in range(self.num_inputs):
+            self.seek_to_scope(i)
+            v_height = self.get_value(b"\x12", from_current=True)
+            self.seek_to_scope(i)
+            v_time = self.get_value(b"\x11", from_current=True)
+
+            has_requirement = False
+            if v_height is not None:
+                height_locktimes.append(int.from_bytes(v_height, "little"))
+                has_requirement = True
+            if v_time is not None:
+                time_locktimes.append(int.from_bytes(v_time, "little"))
+                has_requirement = True
+            if has_requirement:
+                inputs_with_requirements += 1
+
+        if inputs_with_requirements == 0:
+            return fallback
+
+        inputs_supporting_height = len(height_locktimes)
+        inputs_supporting_time = len(time_locktimes)
+
+        # Prefer height-based locktime if every input with requirements supports it
+        if inputs_supporting_height == inputs_with_requirements:
+            return max(height_locktimes)
+        # Fall back to time-based locktime if every input with requirements supports it
+        if inputs_supporting_time == inputs_with_requirements:
+            return max(time_locktimes)
+
+        raise PSBTError(
+            "Cannot determine locktime: inputs have conflicting height and time locktime requirements"
+        )
 
     @property
     def tx_version(self):
         if self._tx_version is None:
             v = self.get_value(b"\x02")
-            self._tx_version = int.from_bytes(v, "little") if v is not None else 0
+            # BIP370: PSBT_GLOBAL_TX_VERSION is a signed int32
+            self._tx_version = (
+                int.from_bytes(v, "little", signed=True) if v is not None else 0
+            )
         return self._tx_version
 
     def seek_to_value(self, key_start, from_current=False):
@@ -468,7 +560,7 @@ class PSBTView:
         sh, anyonecanpay = SIGHASH.check(sighash)
         h = hashes.tagged_hash_init("TapSighash", b"\x00")
         h.update(bytes([sighash]))
-        h.update(self.tx_version.to_bytes(4, "little"))
+        h.update(self.tx_version.to_bytes(4, "little", signed=True))
         h.update(self.locktime.to_bytes(4, "little"))
         if not anyonecanpay:
             h.update(self.hash_prevouts())
@@ -516,7 +608,7 @@ class PSBTView:
         inp = self.vin(input_index)
         zero = b"\x00" * 32  # for sighashes
         h = hashlib.sha256()
-        h.update(self.tx_version.to_bytes(4, "little"))
+        h.update(self.tx_version.to_bytes(4, "little", signed=True))
         if anyonecanpay:
             h.update(zero)
         else:
@@ -556,7 +648,7 @@ class PSBTView:
             return b"\x00" * 31 + b"\x01"
 
         h = hashlib.sha256()
-        h.update(self.tx_version.to_bytes(4, "little"))
+        h.update(self.tx_version.to_bytes(4, "little", signed=True))
         # ANYONECANPAY - only one input is serialized
         if anyonecanpay:
             h.update(compact.to_bytes(1))
@@ -690,6 +782,23 @@ class PSBTView:
             counter += 1
         return counter
 
+    def _update_tx_modifiable(self, inp_sighash: int) -> None:
+        if self.version != 2:
+            return
+
+        is_anyonecanpay = bool(inp_sighash & SIGHASH.ANYONECANPAY)
+        sighash_type = inp_sighash & 0x1F
+
+        if self.tx_modifiable_flags is None:
+            self.tx_modifiable_flags = 0
+
+        if not is_anyonecanpay:
+            self.tx_modifiable_flags &= ~TxModifiable.INPUTS
+        if sighash_type != SIGHASH.NONE:
+            self.tx_modifiable_flags &= ~TxModifiable.OUTPUTS
+        if sighash_type == SIGHASH.SINGLE:
+            self.tx_modifiable_flags |= TxModifiable.SIGHASH_SINGLE
+
     def sign_input(
         self, i, root, sig_stream, sighash=SIGHASH.DEFAULT, extra_scope_data=None
     ) -> int:
@@ -753,7 +862,7 @@ class PSBTView:
         if fingerprint:
             # if taproot derivations are present add them
             for pub in inp.taproot_bip32_derivations:
-                (_leafs, derivation) = inp.taproot_bip32_derivations[pub]
+                _leafs, derivation = inp.taproot_bip32_derivations[pub]
                 if derivation.fingerprint == fingerprint:
                     # Add only if not already present
                     if (pub, derivation) not in bip32_derivations:
@@ -813,6 +922,8 @@ class PSBTView:
             for pub, leaf in inp.taproot_sigs:
                 ser_string(sig_stream, b"\x14" + pub.xonly() + leaf)
                 ser_string(sig_stream, inp.taproot_sigs[(pub, leaf)])
+            if counter > 0:
+                self._update_tx_modifiable(inp_sighash)
             return counter
 
         h = self.sighash(i, sighash=inp_sighash, input_scope=inp)
@@ -824,11 +935,13 @@ class PSBTView:
             # sig plus sighash flag
             inp.partial_sigs[rootpub] = sig.serialize() + bytes([inp_sighash])
             counter += 1
+            self._update_tx_modifiable(inp_sighash)
         for prv, pub in derived_keypairs:
             sig = prv.sign(h)
             # sig plus sighash flag
             inp.partial_sigs[pub] = sig.serialize() + bytes([inp_sighash])
             counter += 1
+            self._update_tx_modifiable(inp_sighash)
         for pub in inp.partial_sigs:
             ser_string(sig_stream, b"\x02" + pub.serialize())
             ser_string(sig_stream, inp.partial_sigs[pub])
@@ -856,6 +969,14 @@ class PSBTView:
                 counter += self.sign_input(i, root, sig_stream, sighash=sighash)
             # add separator
             sig_stream.write(b"\x00")
+        # BIP-370: ensure tx_modifiable_flags is set for v2 PSBTs that didn't
+        # originally include the field, even when no signatures were produced.
+        if (
+            self.version == 2
+            and not self._had_tx_modifiable
+            and self.tx_modifiable_flags is None
+        ):
+            self.tx_modifiable_flags = 0
         return counter
 
     def write_to(
@@ -880,7 +1001,42 @@ class PSBTView:
 
         # first we write global scope
         self.stream.seek(self.offset)
-        res = read_write(self.stream, writable_stream, self.first_scope - self.offset)
+        if (
+            self.version == 2
+            and not self._had_tx_modifiable
+            and self.tx_modifiable_flags is not None
+        ):
+            # Write global entries before the injection point, inject
+            # PSBT_GLOBAL_TX_MODIFIABLE (key 0x06), write remaining global entries
+            # (excluding the original separator), then add the separator.
+            inject_offset = self._tx_modifiable_inject_at - self.offset
+            res = read_write(self.stream, writable_stream, inject_offset)
+            ser_string(writable_stream, b"\x06")
+            ser_string(writable_stream, bytes([self.tx_modifiable_flags]))
+            remaining = self.first_scope - self._tx_modifiable_inject_at - 1
+            res += read_write(self.stream, writable_stream, remaining)
+            writable_stream.write(b"\x00")
+            res += 5  # 1+1 (key) + 1+1 (value) + 1 (separator)
+        elif self.version == 2 and self._had_tx_modifiable:
+            # BIP-370 Signer role: re-serialize the existing 0x06 entry with the
+            # current (potentially updated) tx_modifiable_flags value so that stale
+            # bytes from the original stream are never forwarded to the output.
+            bytes_before = self._tx_modifiable_kv_start - self.offset
+            res = read_write(self.stream, writable_stream, bytes_before)
+            ser_string(writable_stream, b"\x06")
+            ser_string(writable_stream, bytes([self.tx_modifiable_flags]))
+            # Skip original 0x06 entry in the source stream
+            self.stream.seek(self._tx_modifiable_kv_end)
+            # Copy remaining global bytes, excluding the trailing separator
+            remaining = self.first_scope - self._tx_modifiable_kv_end - 1
+            res += read_write(self.stream, writable_stream, remaining)
+            writable_stream.write(b"\x00")
+            # bytes written: bytes_before + 4 (new 0x06 kv) + remaining + 1 (sep)
+            res += self.first_scope - self._tx_modifiable_kv_start
+        else:
+            res = read_write(
+                self.stream, writable_stream, self.first_scope - self.offset
+            )
 
         # write all inputs
         for i in range(self.num_inputs):

@@ -5,7 +5,11 @@ https://github.com/bitcoin/bips/blob/master/bip-0370.mediawiki#user-content-Test
 
 import pytest
 from binascii import unhexlify
-from embit.psbt import PSBT, PSBTError, TxModifiable
+from io import BytesIO
+from embit.psbt import PSBT, PSBTError, TxModifiable, InputScope, OutputScope
+from embit.psbtview import PSBTView
+from embit.script import Script
+from embit.transaction import SIGHASH
 
 
 class TestPSBTVectors:
@@ -428,3 +432,252 @@ class TestPSBTLocktime:
         assert len(psbt.inputs) == 2
         with pytest.raises(PSBTError):
             psbt.determine_locktime()
+
+
+class TestPSBTv2Constructor:
+    """Test BIP-370 Creator / Constructor role: create_v2(), add_input(), add_output()"""
+
+    def test_create_v2_defaults(self):
+        """create_v2() produces a version-2 PSBT with sensible defaults"""
+        psbt = PSBT.create_v2()
+        assert psbt.version == 2
+        assert psbt.tx_version == 2
+        assert psbt.locktime is None
+        assert psbt.tx_modifiable_flags == TxModifiable.INPUTS | TxModifiable.OUTPUTS
+        assert len(psbt.inputs) == 0
+        assert len(psbt.outputs) == 0
+
+    def test_create_v2_custom_params(self):
+        """create_v2() accepts custom tx_version, fallback_locktime and tx_modifiable"""
+        psbt = PSBT.create_v2(
+            tx_version=1,
+            fallback_locktime=600000,
+            tx_modifiable=TxModifiable.INPUTS,
+        )
+        assert psbt.tx_version == 1
+        assert psbt.locktime == 600000
+        assert psbt.tx_modifiable_flags == TxModifiable.INPUTS
+
+    def test_add_input_appends_and_updates_count(self):
+        """add_input() appends the scope and increments the global input count"""
+        psbt = PSBT.create_v2()
+        inp = InputScope()
+        inp.txid = bytes(32)
+        inp.vout = 0
+        psbt.add_input(inp)
+        assert len(psbt.inputs) == 1
+        assert psbt._raw_input_count_from_global == 1
+
+    def test_add_input_requires_inputs_modifiable(self):
+        """add_input() raises when INPUTS bit is clear"""
+        psbt = PSBT.create_v2(tx_modifiable=TxModifiable.OUTPUTS)
+        inp = InputScope()
+        inp.txid = bytes(32)
+        inp.vout = 0
+        with pytest.raises(PSBTError):
+            psbt.add_input(inp)
+
+    def test_add_input_requires_txid(self):
+        """add_input() raises when PSBT_IN_PREVIOUS_TXID is absent"""
+        psbt = PSBT.create_v2()
+        inp = InputScope()
+        inp.vout = 0
+        with pytest.raises(PSBTError):
+            psbt.add_input(inp)
+
+    def test_add_input_requires_vout(self):
+        """add_input() raises when PSBT_IN_OUTPUT_INDEX is absent"""
+        psbt = PSBT.create_v2()
+        inp = InputScope()
+        inp.txid = bytes(32)
+        with pytest.raises(PSBTError):
+            psbt.add_input(inp)
+
+    def test_add_output_appends_and_updates_count(self):
+        """add_output() appends the scope and increments the global output count"""
+        psbt = PSBT.create_v2()
+        out = OutputScope()
+        out.value = 100000
+        out.script_pubkey = Script(b"\x00\x14" + bytes(20))
+        psbt.add_output(out)
+        assert len(psbt.outputs) == 1
+        assert psbt._raw_output_count_from_global == 1
+
+    def test_add_output_requires_outputs_modifiable(self):
+        """add_output() raises when OUTPUTS bit is clear"""
+        psbt = PSBT.create_v2(tx_modifiable=TxModifiable.INPUTS)
+        out = OutputScope()
+        out.value = 100000
+        out.script_pubkey = Script(b"\x00\x14" + bytes(20))
+        with pytest.raises(PSBTError):
+            psbt.add_output(out)
+
+    def test_add_output_requires_amount(self):
+        """add_output() raises when PSBT_OUT_AMOUNT is absent"""
+        psbt = PSBT.create_v2()
+        out = OutputScope()
+        out.script_pubkey = Script(b"\x00\x14" + bytes(20))
+        with pytest.raises(PSBTError):
+            psbt.add_output(out)
+
+    def test_add_output_requires_script(self):
+        """add_output() raises when PSBT_OUT_SCRIPT is absent"""
+        psbt = PSBT.create_v2()
+        out = OutputScope()
+        out.value = 100000
+        with pytest.raises(PSBTError):
+            psbt.add_output(out)
+
+
+class TestTxModifiableUpdate:
+    """Test BIP-370 Signer role: _update_tx_modifiable() correctly restricts future modifications"""
+
+    def test_sighash_all_clears_inputs_and_outputs(self):
+        """SIGHASH_ALL (not ANYONECANPAY) must clear both INPUTS and OUTPUTS bits"""
+        psbt = PSBT.create_v2()
+        psbt.tx_modifiable_flags = TxModifiable.INPUTS | TxModifiable.OUTPUTS
+        psbt._update_tx_modifiable(SIGHASH.ALL)
+        assert not psbt.is_inputs_modifiable()
+        assert not psbt.is_outputs_modifiable()
+        assert not psbt.has_sighash_single()
+
+    def test_sighash_none_clears_inputs_preserves_outputs(self):
+        """SIGHASH_NONE clears INPUTS bit but must not touch the OUTPUTS bit"""
+        psbt = PSBT.create_v2()
+        psbt.tx_modifiable_flags = TxModifiable.INPUTS | TxModifiable.OUTPUTS
+        psbt._update_tx_modifiable(SIGHASH.NONE)
+        assert not psbt.is_inputs_modifiable()
+        assert psbt.is_outputs_modifiable()
+
+    def test_sighash_single_sets_flag_and_clears_inputs(self):
+        """SIGHASH_SINGLE sets SIGHASH_SINGLE flag and clears INPUTS and OUTPUTS bits"""
+        psbt = PSBT.create_v2()
+        psbt.tx_modifiable_flags = TxModifiable.INPUTS | TxModifiable.OUTPUTS
+        psbt._update_tx_modifiable(SIGHASH.SINGLE)
+        assert not psbt.is_inputs_modifiable()
+        assert not psbt.is_outputs_modifiable()
+        assert psbt.has_sighash_single()
+
+    def test_sighash_all_anyonecanpay_preserves_inputs_clears_outputs(self):
+        """SIGHASH_ALL|ANYONECANPAY preserves INPUTS bit and clears OUTPUTS bit"""
+        psbt = PSBT.create_v2()
+        psbt.tx_modifiable_flags = TxModifiable.INPUTS | TxModifiable.OUTPUTS
+        psbt._update_tx_modifiable(SIGHASH.ALL | SIGHASH.ANYONECANPAY)
+        assert psbt.is_inputs_modifiable()
+        assert not psbt.is_outputs_modifiable()
+
+    def test_update_creates_flags_when_absent(self):
+        """_update_tx_modifiable initialises the field to 0 when it was absent"""
+        psbt = PSBT.create_v2()
+        psbt.tx_modifiable_flags = None
+        psbt._update_tx_modifiable(SIGHASH.ALL)
+        assert psbt.tx_modifiable_flags == 0
+
+    def test_no_op_for_psbtv0(self):
+        """_update_tx_modifiable is a no-op for PSBTv0 (PSBT_GLOBAL_TX_MODIFIABLE is v2-only)"""
+        psbt = PSBT.create_v2()
+        psbt.version = None  # downgrade to v0
+        psbt.tx_modifiable_flags = TxModifiable.INPUTS | TxModifiable.OUTPUTS
+        psbt._update_tx_modifiable(SIGHASH.ALL)
+        # must remain untouched because version != 2
+        assert psbt.tx_modifiable_flags == TxModifiable.INPUTS | TxModifiable.OUTPUTS
+
+
+class TestPSBTViewTxModifiable:
+    """Test PSBTView re-serialises PSBT_GLOBAL_TX_MODIFIABLE with the updated value"""
+
+    # PSBTv2 with PSBT_GLOBAL_TX_MODIFIABLE = 0x03 (INPUTS | OUTPUTS modifiable),
+    # 1 input, 2 outputs.  Re-used from TestPSBTVectors.test_inputs_and_outputs_modifiable.
+    _HEX_TX_MOD_03 = (
+        "70736274ff0102040200000001040101010501020106010301fb0402000000000100520200000001"
+        "c1aa256e214b96a1822f93de42bff3b5f3ff8d0519306e3515d7515a5e805b120000000000ffff"
+        "ffff0118c69a3b00000000160014b0a3af144208412693ca7d166852b52db0aef06e000000000101"
+        "1f18c69a3b00000000160014b0a3af144208412693ca7d166852b52db0aef06e010e200b0ad92141"
+        "9c1c8719735d72dc739f9ea9e0638d1fe4c1eef0f9944084815fc8010f040000000000220202d601"
+        "f84846a6755f776be00e3d9de8fb10acc935fb83c45fb0162d4cad5ab79218f69d873e5400008001"
+        "00008000000080000000002a0000000103080008af2f000000000104160014c430f64c4756da310d"
+        "bd1a085572ef299926272c00220202e36fbff53dd534070cf8fd396614680f357a9b85db7340bf1c"
+        "fa745d2ad7b34018f69d873e54000080010000800000008001000000640000000103088bbdeb0b00"
+        "0000000104160014 4dd193ac964a56ac1b9e1cca8454fe2f474f851300"
+    ).replace(" ", "")
+
+    def test_psbtview_detects_existing_tx_modifiable(self):
+        """PSBTView.view() sets _had_tx_modifiable=True when 0x06 is present in stream"""
+        raw = unhexlify(self._HEX_TX_MOD_03)
+        psbt_view = PSBTView.view(BytesIO(raw))
+        assert psbt_view._had_tx_modifiable is True
+        assert psbt_view.tx_modifiable_flags == 0x03
+
+    def test_psbtview_rewrites_updated_flags(self):
+        """write_to() must emit the updated tx_modifiable_flags, not the stale stream bytes"""
+        raw = unhexlify(self._HEX_TX_MOD_03)
+        psbt_view = PSBTView.view(BytesIO(raw))
+        assert psbt_view.tx_modifiable_flags == 0x03
+
+        # Simulate the Signer role clearing both modifiable bits after signing
+        psbt_view.tx_modifiable_flags = 0x00
+
+        out = BytesIO()
+        psbt_view.write_to(out)
+        out.seek(0)
+        reparsed = PSBT.parse(out.read())
+
+        assert reparsed.tx_modifiable_flags == 0x00
+        assert not reparsed.is_inputs_modifiable()
+        assert not reparsed.is_outputs_modifiable()
+
+    def test_psbtview_unchanged_flags_round_trip(self):
+        """write_to() must also preserve flags correctly when the value is unchanged"""
+        raw = unhexlify(self._HEX_TX_MOD_03)
+        psbt_view = PSBTView.view(BytesIO(raw))
+
+        out = BytesIO()
+        psbt_view.write_to(out)
+        out.seek(0)
+        reparsed = PSBT.parse(out.read())
+
+        assert reparsed.tx_modifiable_flags == 0x03
+
+
+class TestPSBTGlobalVersionField:
+    """Test PSBT_GLOBAL_VERSION field validation (Fix 2 — version must be exactly 4 bytes)"""
+
+    def test_explicit_version_zero_accepted(self):
+        """PSBTv0 with an explicit PSBT_GLOBAL_VERSION=0 (4 bytes) is accepted per BIP-174"""
+        # Start from the existing invalid test vector (v0 with version=2) and flip
+        # the version value from 0x02000000 to 0x00000000 to get a valid v0+explicit-version.
+        invalid_v0_with_v2 = (
+            "70736274ff01007102000000010b0ad921419c1c8719735d72dc739f9ea9e0638d1fe4c1eef0"
+            "f9944084815fc80000000000feffffff020008af2f00000000160014c430f64c4756da310dbd"
+            "1a085572ef299926272c8bbdeb0b00000000160014a07dac8ab6ca942d379ed795f835ba71c9"
+            "cc68850000000001fb0402000000000100520200000001c1aa256e214b96a1822f93de42bff3"
+            "b5f3ff8d0519306e3515d7515a5e805b120000000000ffffffff0118c69a3b000000001600"
+            "14b0a3af144208412693ca7d166852b52db0aef06e0000000001011f18c69a3b00000000160"
+            "014b0a3af144208412693ca7d166852b52db0aef06e01086b02473044022005275a485734e0"
+            "ae1f3b971237586f0e72dc85833d278c0e474cd23112c0fa5e02206b048c83cebc3c41d0b93"
+            "cc7da76185cedbd030d005b08018be2b98bbacbdf7b012103760dcca05f3997dc65b293060f"
+            "7f29f1514c8c527048e12802b041d4fc340a2700220202d601f84846a6755f776be00e3d9de"
+            "8fb10acc935fb83c45fb0162d4cad5ab79218f69d873e540000800100008000000080000000"
+            "002a0000000022020 36efe2c255621986553ba9d65c3ddc64165ca1436e05aa35a4c6eb024"
+            "51cf796d18f69d873e540000800100008000000080010000006200000000"
+        ).replace(" ", "")
+        # Replace version=2 bytes with version=0 bytes
+        v0_with_explicit_v0 = invalid_v0_with_v2.replace(
+            "01fb0402000000", "01fb0400000000"
+        )
+        psbt = PSBT.parse(unhexlify(v0_with_explicit_v0))
+        assert psbt.version is None  # parsed as v0
+
+    def test_version_wrong_length_rejected(self):
+        """PSBT_GLOBAL_VERSION value that is not exactly 4 bytes must be rejected"""
+        # Take a minimal valid PSBTv2 and corrupt the version field length from 04 to 02
+        valid_v2 = (
+            "70736274ff01020402000000010401010105010201fb040200000000010e200b0ad921419c1c"
+            "8719735d72dc739f9ea9e0638d1fe4c1eef0f9944084815fc8010f04000000000001030800"
+            "08af2f000000000104160014c430f64c4756da310dbd1a085572ef299926272c000103088b"
+            "bdeb0b0000000001041600144dd193ac964a56ac1b9e1cca8454fe2f474f851300"
+        ).replace(" ", "")
+        # Replace "01fb04 02000000" with "01fb02 0200" (value length 2, truncated)
+        truncated = valid_v2.replace("01fb0402000000", "01fb020200")
+        with pytest.raises(PSBTError):
+            PSBT.parse(unhexlify(truncated))
