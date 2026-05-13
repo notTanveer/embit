@@ -281,6 +281,8 @@ class PSBTView:
             else:
                 value = read_string(stream)
                 cur += len(value) + len(compact.to_bytes(len(value)))
+                if key in global_kvs:
+                    raise PSBTError("Duplicate global key: %s" % key)
                 global_kvs[key] = value
                 if key == b"\xfb":
                     version = int.from_bytes(value, "little")
@@ -484,10 +486,15 @@ class PSBTView:
     def tx_version(self):
         if self._tx_version is None:
             v = self.get_value(b"\x02")
-            # BIP370: PSBT_GLOBAL_TX_VERSION is a signed int32
-            self._tx_version = (
-                int.from_bytes(v, "little", signed=True) if v is not None else 0
-            )
+            if v is None:
+                if self.version == 2:
+                    raise PSBTError("Missing PSBT_GLOBAL_TX_VERSION in PSBTv2")
+                self._tx_version = 0
+            else:
+                if len(v) != 4:
+                    raise PSBTError("Invalid PSBT_GLOBAL_TX_VERSION length")
+                # BIP370: PSBT_GLOBAL_TX_VERSION is a signed int32
+                self._tx_version = int.from_bytes(v, "little", signed=True)
         return self._tx_version
 
     def seek_to_value(self, key_start, from_current=False):
