@@ -798,7 +798,7 @@ class PSBT(EmbitBase):
                 f"PSBTv2 output {i} missing required PSBT_OUT_SCRIPT (0x04)"
             )
 
-    def __init__(self, tx=None, unknown={}, version=None):
+    def __init__(self, tx=None, unknown=None, version=None):
         self.version = version  # None for v0, 2 for v2
         self.inputs = []
         self.outputs = []
@@ -811,7 +811,7 @@ class PSBT(EmbitBase):
         if tx is not None:
             self.parse_tx(tx)
 
-        self.unknown = unknown
+        self.unknown = {} if unknown is None else unknown
         self.xpubs = OrderedDict()
         self.parse_unknowns()
 

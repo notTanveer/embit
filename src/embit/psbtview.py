@@ -182,10 +182,7 @@ class PSBTView:
         version=None,
         tx_offset=None,
         compress=CompressMode.KEEP_ALL,
-        tx_modifiable_flags=None,
-        tx_modifiable_inject_at=None,
-        tx_modifiable_kv_start=None,
-        tx_modifiable_kv_end=None,
+        global_kvs=None,
     ):
         if version != 2 and tx_offset is None:
             raise PSBTError("Global tx is not found, but PSBT version is %d" % version)
@@ -202,18 +199,34 @@ class PSBTView:
         self.compress = compress
         self._tx_version = self.tx.version if self.tx else None
         self._locktime = self.tx.locktime if self.tx else None
-        self.tx_modifiable_flags = tx_modifiable_flags
-        self._had_tx_modifiable = tx_modifiable_flags is not None
-        # Byte offset where TX_MODIFIABLE should be injected (right after the last key < 0x06)
-        self._tx_modifiable_inject_at = (
-            tx_modifiable_inject_at
-            if tx_modifiable_inject_at is not None
-            else first_scope - 1
-        )
-        # Byte range [start, end) of the existing 0x06 kv pair in the stream (None when absent)
-        self._tx_modifiable_kv_start = tx_modifiable_kv_start
-        self._tx_modifiable_kv_end = tx_modifiable_kv_end
+        # For PSBTv2: dict of all global key→value pairs (excluding the \x00 global tx).
+        # This is the single source of truth for every global field, including
+        # PSBT_GLOBAL_TX_MODIFIABLE (\x06). None for PSBTv0 where the global
+        # scope is streamed verbatim.
+        self._global_kvs = global_kvs
         self.clear_cache()
+
+    @property
+    def tx_modifiable_flags(self):
+        """PSBT_GLOBAL_TX_MODIFIABLE byte (PSBTv2 only). None when absent or for PSBTv0."""
+        if self._global_kvs is None:
+            return None
+        v = self._global_kvs.get(b"\x06")
+        if v is None:
+            return None
+        if len(v) != 1:
+            raise PSBTError("Invalid PSBT_GLOBAL_TX_MODIFIABLE length")
+        return int.from_bytes(v, "little")
+
+    @tx_modifiable_flags.setter
+    def tx_modifiable_flags(self, value):
+        """Setting to None removes the field; ignored for PSBTv0."""
+        if self._global_kvs is None:
+            return
+        if value is None:
+            self._global_kvs.pop(b"\x06", None)
+        else:
+            self._global_kvs[b"\x06"] = bytes([value])
 
     def clear_cache(self):
         # cache for digests
@@ -239,34 +252,17 @@ class PSBTView:
         num_inputs = None
         num_outputs = None
         tx_offset = None
-        tx_modifiable_flags = None
-        tx_modifiable_kv_start = None
-        tx_modifiable_kv_end = None
-        # Track where TX_MODIFIABLE (key 0x06) should be injected: right after the
-        # last key-value whose first key byte is less than 0x06.
-        tx_modifiable_inject_at = offset + len(cls.MAGIC)
+        # Collect all non-global-tx key-value pairs for PSBTv2 global scope rewriting.
+        # The global scope is small, so materialising it avoids byte-level injection.
+        global_kvs = {}
         while True:
             # read key and update cursor
-            before_key_cur = cur
             key = read_string(stream)
             cur += len(key) + len(compact.to_bytes(len(key)))
             # separator
             if len(key) == 0:
                 break
-            if key in [b"\xfb", b"\x04", b"\x05", b"\x06"]:
-                value = read_string(stream)
-                cur += len(value) + len(compact.to_bytes(len(value)))
-                if key == b"\xfb":
-                    version = int.from_bytes(value, "little")
-                elif key == b"\x04":
-                    num_inputs = compact.from_bytes(value)
-                elif key == b"\x05":
-                    num_outputs = compact.from_bytes(value)
-                elif key == b"\x06":
-                    tx_modifiable_flags = int.from_bytes(value, "little")
-                    tx_modifiable_kv_start = before_key_cur
-                    tx_modifiable_kv_end = cur
-            elif key == b"\x00":
+            if key == b"\x00":
                 # we found global transaction; defer version==2 check until after the loop
                 # so that PSBT_GLOBAL_UNSIGNED_TX is rejected even when it appears before
                 # PSBT_GLOBAL_VERSION (key order is not guaranteed).
@@ -282,11 +278,15 @@ class PSBTView:
                 stream.seek(tx_offset + tx_len)
                 cur += tx_len
             else:
-                cur += skip_string(stream)
-            # Update injection point: TX_MODIFIABLE belongs after all keys whose
-            # first byte is less than 0x06 (i.e. keys 0x00-0x05).
-            if key and key[0] < 0x06:
-                tx_modifiable_inject_at = cur
+                value = read_string(stream)
+                cur += len(value) + len(compact.to_bytes(len(value)))
+                global_kvs[key] = value
+                if key == b"\xfb":
+                    version = int.from_bytes(value, "little")
+                elif key == b"\x04":
+                    num_inputs = compact.from_bytes(value)
+                elif key == b"\x05":
+                    num_outputs = compact.from_bytes(value)
         first_scope = cur
         # PSBTv2 must not have a global unsigned transaction, regardless of key order
         if tx_offset is not None and version == 2:
@@ -302,10 +302,7 @@ class PSBTView:
             version,
             tx_offset,
             compress,
-            tx_modifiable_flags,
-            tx_modifiable_inject_at,
-            tx_modifiable_kv_start,
-            tx_modifiable_kv_end,
+            global_kvs=global_kvs if version == 2 else None,
         )
 
     def _skip_scope(self):
@@ -969,13 +966,10 @@ class PSBTView:
                 counter += self.sign_input(i, root, sig_stream, sighash=sighash)
             # add separator
             sig_stream.write(b"\x00")
-        # BIP-370: ensure tx_modifiable_flags is set for v2 PSBTs that didn't
-        # originally include the field, even when no signatures were produced.
-        if (
-            self.version == 2
-            and not self._had_tx_modifiable
-            and self.tx_modifiable_flags is None
-        ):
+        # BIP-370: signer must set PSBT_GLOBAL_TX_MODIFIABLE for PSBTv2.
+        # Default to 0 (nothing modifiable) when no signing occurred and the
+        # field was absent — avoids leaving the field missing after a sign pass.
+        if self.version == 2 and self.tx_modifiable_flags is None:
             self.tx_modifiable_flags = 0
         return counter
 
@@ -1000,40 +994,19 @@ class PSBTView:
             compress = self.compress
 
         # first we write global scope
-        self.stream.seek(self.offset)
-        if (
-            self.version == 2
-            and not self._had_tx_modifiable
-            and self.tx_modifiable_flags is not None
-        ):
-            # Write global entries before the injection point, inject
-            # PSBT_GLOBAL_TX_MODIFIABLE (key 0x06), write remaining global entries
-            # (excluding the original separator), then add the separator.
-            inject_offset = self._tx_modifiable_inject_at - self.offset
-            res = read_write(self.stream, writable_stream, inject_offset)
-            ser_string(writable_stream, b"\x06")
-            ser_string(writable_stream, bytes([self.tx_modifiable_flags]))
-            remaining = self.first_scope - self._tx_modifiable_inject_at - 1
-            res += read_write(self.stream, writable_stream, remaining)
-            writable_stream.write(b"\x00")
-            res += 5  # 1+1 (key) + 1+1 (value) + 1 (separator)
-        elif self.version == 2 and self._had_tx_modifiable:
-            # BIP-370 Signer role: re-serialize the existing 0x06 entry with the
-            # current (potentially updated) tx_modifiable_flags value so that stale
-            # bytes from the original stream are never forwarded to the output.
-            bytes_before = self._tx_modifiable_kv_start - self.offset
-            res = read_write(self.stream, writable_stream, bytes_before)
-            ser_string(writable_stream, b"\x06")
-            ser_string(writable_stream, bytes([self.tx_modifiable_flags]))
-            # Skip original 0x06 entry in the source stream
-            self.stream.seek(self._tx_modifiable_kv_end)
-            # Copy remaining global bytes, excluding the trailing separator
-            remaining = self.first_scope - self._tx_modifiable_kv_end - 1
-            res += read_write(self.stream, writable_stream, remaining)
-            writable_stream.write(b"\x00")
-            # bytes written: bytes_before + 4 (new 0x06 kv) + remaining + 1 (sep)
-            res += self.first_scope - self._tx_modifiable_kv_start
+        if self._global_kvs is not None:
+            # PSBTv2: reconstruct global scope from the materialised key-value dict.
+            # This sidesteps byte-level injection and gives deterministic key ordering.
+            writable_stream.write(self.MAGIC)
+            res = len(self.MAGIC)
+            for k in sorted(self._global_kvs.keys()):
+                res += ser_string(writable_stream, k)
+                res += ser_string(writable_stream, self._global_kvs[k])
+            writable_stream.write(b"\x00")  # global scope separator
+            res += 1
         else:
+            # PSBTv0: stream global scope directly from source (includes global tx).
+            self.stream.seek(self.offset)
             res = read_write(
                 self.stream, writable_stream, self.first_scope - self.offset
             )

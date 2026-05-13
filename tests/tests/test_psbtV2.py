@@ -602,10 +602,10 @@ class TestPSBTViewTxModifiable:
     ).replace(" ", "")
 
     def test_psbtview_detects_existing_tx_modifiable(self):
-        """PSBTView.view() sets _had_tx_modifiable=True when 0x06 is present in stream"""
+        """PSBTView.view() records 0x06 in _global_kvs and parses tx_modifiable_flags"""
         raw = unhexlify(self._HEX_TX_MOD_03)
         psbt_view = PSBTView.view(BytesIO(raw))
-        assert psbt_view._had_tx_modifiable is True
+        assert b"\x06" in psbt_view._global_kvs
         assert psbt_view.tx_modifiable_flags == 0x03
 
     def test_psbtview_rewrites_updated_flags(self):
