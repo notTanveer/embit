@@ -28,6 +28,7 @@ from .psbt import (
     InputScope,
     OutputScope,
     TxModifiable,
+    LOCKTIME_THRESHOLD,
     read_string,
     ser_string,
     skip_string,
@@ -421,7 +422,12 @@ class PSBTView:
         a requirement.
         """
         v = self.get_value(b"\x03")
-        fallback = int.from_bytes(v, "little") if v is not None else 0
+        if v is not None:
+            if len(v) != 4:
+                raise PSBTError("PSBT_GLOBAL_FALLBACK_LOCKTIME must be 4 bytes")
+            fallback = int.from_bytes(v, "little")
+        else:
+            fallback = 0
 
         height_locktimes = []
         time_locktimes = []
@@ -435,10 +441,24 @@ class PSBTView:
 
             has_requirement = False
             if v_height is not None:
-                height_locktimes.append(int.from_bytes(v_height, "little"))
+                if len(v_height) != 4:
+                    raise PSBTError("PSBT_IN_REQUIRED_HEIGHT_LOCKTIME must be 4 bytes")
+                height_locktime = int.from_bytes(v_height, "little")
+                if height_locktime == 0 or height_locktime >= LOCKTIME_THRESHOLD:
+                    raise PSBTError(
+                        f"Height-based locktime must be > 0 and < {LOCKTIME_THRESHOLD}"
+                    )
+                height_locktimes.append(height_locktime)
                 has_requirement = True
             if v_time is not None:
-                time_locktimes.append(int.from_bytes(v_time, "little"))
+                if len(v_time) != 4:
+                    raise PSBTError("PSBT_IN_REQUIRED_TIME_LOCKTIME must be 4 bytes")
+                time_locktime = int.from_bytes(v_time, "little")
+                if time_locktime < LOCKTIME_THRESHOLD:
+                    raise PSBTError(
+                        f"Time-based locktime must be >= {LOCKTIME_THRESHOLD}"
+                    )
+                time_locktimes.append(time_locktime)
                 has_requirement = True
             if has_requirement:
                 inputs_with_requirements += 1
