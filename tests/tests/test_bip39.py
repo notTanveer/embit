@@ -173,8 +173,24 @@ class Bip39Test(TestCase):
             self.assertEqual(act_xkey.to_base58(), xprv)
 
     def test_invalid_length(self):
-        words = "panel trumpet seek bridge income piano history car flower aim loan accident embark canoe"
-        self.assertFalse(mnemonic_is_valid(words))
+        invalid_length = [
+            # not divisible by 3, too short, too long
+            "panel trumpet seek bridge income piano history car flower aim loan accident embark canoe",
+            "zoo " * 8 + "zebra",
+            "zoo " * 26 + "valley",
+        ]
+        for words in invalid_length:
+            self.assertFalse(mnemonic_is_valid(words))
+            self.assertRaises(ValueError, mnemonic_to_bytes, words)
+
+        invalid_length = [
+            # not divisible by 4, too short, too long
+            b"\x00" * 19,
+            b"\x00" * 12,
+            b"\x00" * 36,
+        ]
+        for entropy in invalid_length:
+            self.assertRaises(ValueError, mnemonic_from_bytes, entropy)
 
     def test_invalid_word(self):
         words = "fljsafk minute glow ride mask ceiling old limb rookie discover cotton biology"
@@ -189,6 +205,21 @@ class Bip39Test(TestCase):
     def test_invalid_seed(self):
         seed = "0000000000000000000000000000000042"
         self.assertRaises(ValueError, lambda x: mnemonic_from_bytes(unhexlify(x)), seed)
+
+    def test_spaces(self):
+        """Test that mnemonic with leading / trailing / double spaces are invalid."""
+        # valid mnemonic
+        mnemonic = "abandon " * 11 + "about"
+        self.assertTrue(mnemonic_is_valid(mnemonic))
+        # leading / trailing space
+        self.assertFalse(mnemonic_is_valid(" " + mnemonic))
+        self.assertFalse(mnemonic_is_valid(mnemonic + " "))
+        # double space
+        mnemonic = "abandon " * 11 + " about"
+        self.assertFalse(mnemonic_is_valid(mnemonic))
+        # new line instead of space
+        mnemonic = "abandon\n" * 11 + "about"
+        self.assertFalse(mnemonic_is_valid(mnemonic))
 
     def test_find_candidates_happy(self):
         prefix = "a"
