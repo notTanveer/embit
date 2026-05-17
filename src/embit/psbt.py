@@ -18,6 +18,9 @@ from .base import EmbitBase, EmbitError
 from binascii import b2a_base64, a2b_base64, hexlify, unhexlify
 from io import BytesIO
 
+# Import SP module - must come after other imports to avoid circular deps
+from . import psbtv2_sp
+
 LOCKTIME_THRESHOLD = 500000000
 
 
@@ -159,6 +162,11 @@ class InputScope(PSBTScope):
         self.final_scriptwitness = None
         self.required_time_locktime = None
         self.required_height_locktime = None
+
+        # BIP-375 SP fields
+        self.sp_ecdh_shares = OrderedDict()  # scan_key -> ecdh_share (33 bytes)
+        self.sp_dleq_proofs = OrderedDict()  # scan_key -> dleq_proof (64 bytes)
+
         self.parse_unknowns()
 
     def clear_metadata(self, compress=CompressMode.CLEAR_ALL):
@@ -175,6 +183,8 @@ class InputScope(PSBTScope):
         else:
             if self.witness_utxo is not None:
                 self.non_witness_utxo = None
+        self.sp_ecdh_shares = OrderedDict()
+        self.sp_dleq_proofs = OrderedDict()
         self.bip32_derivations = OrderedDict()
         self.taproot_bip32_derivations = OrderedDict()
         self.taproot_internal_key = None
@@ -214,6 +224,8 @@ class InputScope(PSBTScope):
             if other.required_height_locktime is not None
             else self.required_height_locktime
         )
+        self.sp_ecdh_shares.update(other.sp_ecdh_shares)
+        self.sp_dleq_proofs.update(other.sp_dleq_proofs)
 
     @property
     def vin(self):
@@ -428,8 +440,7 @@ class InputScope(PSBTScope):
             locktime = int.from_bytes(v, "little")
             if locktime >= LOCKTIME_THRESHOLD or locktime == 0:
                 raise PSBTError(
-                    "Height-based locktime must be > 0 and < %d"
-                    % LOCKTIME_THRESHOLD
+                    "Height-based locktime must be > 0 and < %d" % LOCKTIME_THRESHOLD
                 )
             self.required_height_locktime = locktime
 
@@ -478,6 +489,32 @@ class InputScope(PSBTScope):
         # PSBT_IN_TAP_MERKLE_ROOT
         elif k[0] == 0x18:
             self.taproot_merkle_root = v
+
+        # PSBT_IN_SP_ECDH_SHARE (BIP-375)
+        elif k[0] == 0x1D:
+            if version != 2:
+                raise PSBTError("PSBT_IN_SP_ECDH_SHARE not allowed in PSBTv0")
+            if len(k) != 34:  # 1 byte type + 33 bytes scan key
+                raise PSBTError("Invalid PSBT_IN_SP_ECDH_SHARE key length")
+            if len(v) != 33:
+                raise PSBTError("PSBT_IN_SP_ECDH_SHARE value must be 33 bytes")
+            scan_key = k[1:]
+            if scan_key in self.sp_ecdh_shares:
+                raise PSBTError("Duplicated PSBT_IN_SP_ECDH_SHARE for scan key")
+            self.sp_ecdh_shares[scan_key] = v
+
+        # PSBT_IN_SP_DLEQ (BIP-375)
+        elif k[0] == 0x1E:
+            if version != 2:
+                raise PSBTError("PSBT_IN_SP_DLEQ not allowed in PSBTv0")
+            if len(k) != 34:  # 1 byte type + 33 bytes scan key
+                raise PSBTError("Invalid PSBT_IN_SP_DLEQ key length")
+            if len(v) != 64:
+                raise PSBTError("PSBT_IN_SP_DLEQ value must be 64 bytes")
+            scan_key = k[1:]
+            if scan_key in self.sp_dleq_proofs:
+                raise PSBTError("Duplicated PSBT_IN_SP_DLEQ for scan key")
+            self.sp_dleq_proofs[scan_key] = v
 
         else:
             if k in self.unknown:
@@ -575,6 +612,14 @@ class InputScope(PSBTScope):
             r += ser_string(stream, b"\x18")
             r += ser_string(stream, self.taproot_merkle_root)
 
+        # BIP-375 SP fields
+        for scan_key in self.sp_ecdh_shares:
+            r += ser_string(stream, b"\x1d" + scan_key)
+            r += ser_string(stream, self.sp_ecdh_shares[scan_key])
+        for scan_key in self.sp_dleq_proofs:
+            r += ser_string(stream, b"\x1e" + scan_key)
+            r += ser_string(stream, self.sp_dleq_proofs[scan_key])
+
         # unknown
         for key in self.unknown:
             r += ser_string(stream, key)
@@ -634,6 +679,11 @@ class OutputScope(PSBTScope):
         self.bip32_derivations = OrderedDict()
         self.taproot_bip32_derivations = OrderedDict()
         self.taproot_internal_key = None
+
+        # BIP-375 SP fields
+        self.sp_data = None  # SilentPaymentData (PSBT_OUT_SP_V0_INFO)
+        self.sp_label = None  # uint32 label (PSBT_OUT_SP_V0_LABEL)
+
         self.parse_unknowns()
 
     def clear_metadata(self, compress=CompressMode.CLEAR_ALL):
@@ -646,6 +696,8 @@ class OutputScope(PSBTScope):
         self.bip32_derivations = OrderedDict()
         self.taproot_bip32_derivations = OrderedDict()
         self.taproot_internal_key = None
+        self.sp_data = None
+        self.sp_label = None
 
     def update(self, other):
         self.value = other.value if other.value is not None else self.value
@@ -656,6 +708,8 @@ class OutputScope(PSBTScope):
         self.bip32_derivations.update(other.bip32_derivations)
         self.taproot_bip32_derivations.update(other.taproot_bip32_derivations)
         self.taproot_internal_key = other.taproot_internal_key
+        self.sp_data = other.sp_data or self.sp_data
+        self.sp_label = other.sp_label if other.sp_label is not None else self.sp_label
 
     @property
     def vout(self):
@@ -724,6 +778,29 @@ class OutputScope(PSBTScope):
                 der = DerivationPath.read_from(b)
                 self.taproot_bip32_derivations[pub] = (leaf_hashes, der)
 
+        # PSBT_OUT_SP_V0_INFO (BIP-375)
+        elif k == b"\x09":
+            if version != 2:
+                raise PSBTError("PSBT_OUT_SP_V0_INFO not allowed in PSBTv0")
+            if len(v) != 66:
+                raise PSBTError("PSBT_OUT_SP_V0_INFO must be 66 bytes")
+            if self.sp_data is not None:
+                raise PSBTError("Duplicated PSBT_OUT_SP_V0_INFO")
+            try:
+                self.sp_data = psbtv2_sp.SilentPaymentData.parse(v)
+            except psbtv2_sp.SPFieldError as e:
+                raise PSBTError(f"Invalid PSBT_OUT_SP_V0_INFO: {e}")
+
+        # PSBT_OUT_SP_V0_LABEL (BIP-375)
+        elif k == b"\x0a":
+            if version != 2:
+                raise PSBTError("PSBT_OUT_SP_V0_LABEL not allowed in PSBTv0")
+            if len(v) != 4:
+                raise PSBTError("PSBT_OUT_SP_V0_LABEL must be 4 bytes")
+            if self.sp_label is not None:
+                raise PSBTError("Duplicated PSBT_OUT_SP_V0_LABEL")
+            self.sp_label = int.from_bytes(v, "little")
+
         else:
             if k in self.unknown:
                 raise PSBTError("Duplicated key")
@@ -765,6 +842,14 @@ class OutputScope(PSBTScope):
                 + b"".join(leaf_hashes)
                 + derivation.serialize(),
             )
+
+        # BIP-375 SP fields
+        if self.sp_data is not None:
+            r += ser_string(stream, b"\x09")
+            r += ser_string(stream, self.sp_data.serialize())
+        if self.sp_label is not None:
+            r += ser_string(stream, b"\x0a")
+            r += ser_string(stream, self.sp_label.to_bytes(4, "little"))
 
         # unknown
         for key in self.unknown:
@@ -828,6 +913,10 @@ class PSBT(EmbitBase):
 
         self.unknown = {} if unknown is None else unknown
         self.xpubs = OrderedDict()
+
+        # BIP-375 SP global fields
+        self.sp_ecdh_shares = OrderedDict()  # scan_key -> ecdh_share (33 bytes)
+        self.sp_dleq_proofs = OrderedDict()  # scan_key -> dleq_proof (64 bytes)
         self.parse_unknowns()
 
     def parse_tx(self, tx):
@@ -991,6 +1080,15 @@ class PSBT(EmbitBase):
                 r += ser_string(stream, bytes([self.tx_modifiable_flags]))
             r += ser_string(stream, b"\xfb")
             r += ser_string(stream, self.version.to_bytes(4, "little"))
+
+            # BIP-375 SP global fields
+            for scan_key in self.sp_ecdh_shares:
+                r += ser_string(stream, b"\x07" + scan_key)
+                r += ser_string(stream, self.sp_ecdh_shares[scan_key])
+            for scan_key in self.sp_dleq_proofs:
+                r += ser_string(stream, b"\x08" + scan_key)
+                r += ser_string(stream, self.sp_dleq_proofs[scan_key])
+
         # unknown
         for key in self.unknown:
             r += ser_string(stream, key)
@@ -1043,9 +1141,7 @@ class PSBT(EmbitBase):
                 break
             value = read_string(stream)
             if key in global_kvs:
-                raise PSBTError(
-                    "Duplicated global key: %s" % hexlify(key).decode()
-                )
+                raise PSBTError("Duplicated global key: %s" % hexlify(key).decode())
             global_kvs[key] = value
 
         # Determine PSBT version from PSBT_GLOBAL_VERSION (0xfb)
@@ -1219,6 +1315,26 @@ class PSBT(EmbitBase):
                     )
                     # Store count only; do not pre-allocate objects to avoid
                     # attacker-controlled memory exhaustion.
+            elif k[0] == 0x07 and len(k) == 34:  # PSBT_GLOBAL_SP_ECDH_SHARE
+                if self.version != 2:
+                    continue
+                v = self.unknown.pop(k)
+                if len(v) != 33:
+                    raise PSBTError("PSBT_GLOBAL_SP_ECDH_SHARE value must be 33 bytes")
+                scan_key = k[1:]
+                if scan_key in self.sp_ecdh_shares:
+                    raise PSBTError("Duplicated PSBT_GLOBAL_SP_ECDH_SHARE for scan key")
+                self.sp_ecdh_shares[scan_key] = v
+            elif k[0] == 0x08 and len(k) == 34:  # PSBT_GLOBAL_SP_DLEQ
+                if self.version != 2:
+                    continue
+                v = self.unknown.pop(k)
+                if len(v) != 64:
+                    raise PSBTError("PSBT_GLOBAL_SP_DLEQ value must be 64 bytes")
+                scan_key = k[1:]
+                if scan_key in self.sp_dleq_proofs:
+                    raise PSBTError("Duplicated PSBT_GLOBAL_SP_DLEQ for scan key")
+                self.sp_dleq_proofs[scan_key] = v
 
     def sighash(self, i, sighash=SIGHASH.ALL, **kwargs):
         inp = self.inputs[i]
