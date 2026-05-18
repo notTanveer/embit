@@ -274,32 +274,36 @@ class BIP375Validator:
             )
 
     def _get_input_public_key(self, inp, inp_idx: int) -> Optional[ec.PublicKey]:
-        """Extract public key from an input."""
-        # Try to get from witness_utxo script
-        if inp.witness_utxo:
-            script_type = inp.witness_utxo.script_pubkey.script_type()
-            if script_type == "p2wpkh":
-                # P2WPKH: pubkey is in the script
-                script_data = inp.witness_utxo.script_pubkey.data
-                if len(script_data) >= 2:
-                    return ec.PublicKey.parse(b"\x02" + script_data[1:])
-            elif script_type == "p2pkh":
-                # P2PKH: need to get from redeem script or witness
-                pass
+        """Extract the input's signing public key using hash-matching against the UTXO script."""
+        from .hashes import hash160
 
-        # Try from BIP32 derivations
-        if inp.bip32_derivations:
-            # Return first available derived public key
+        script = inp.script_pubkey
+        if script is None:
+            return None
+
+        script_type = script.script_type()
+
+        if script_type == "p2wpkh":
+            # script = 0x00 0x14 <20-byte hash160(pubkey)>
+            pkh = bytes(script.data[2:22])
             for pubkey in inp.bip32_derivations:
-                return pubkey
+                if hash160(pubkey.sec()) == pkh:
+                    return pubkey
 
-        # Try from witness script
-        if inp.witness_script:
-            script_type = inp.witness_script.script_type()
-            if script_type == "p2wpkh":
-                script_data = inp.witness_script.data
-                if len(script_data) >= 2:
-                    return ec.PublicKey.parse(b"\x02" + script_data[1:])
+        elif script_type == "p2pkh":
+            # script = 0x76 0xa9 0x14 <20-byte hash160(pubkey)> 0x88 0xac
+            pkh = bytes(script.data[3:23])
+            for pubkey in inp.bip32_derivations:
+                if hash160(pubkey.sec()) == pkh:
+                    return pubkey
+
+        elif script_type == "p2sh" and inp.redeem_script:
+            # P2SH-P2WPKH: redeem script = 0x00 0x14 <20-byte hash160(pubkey)>
+            if inp.redeem_script.script_type() == "p2wpkh":
+                pkh = bytes(inp.redeem_script.data[2:22])
+                for pubkey in inp.bip32_derivations:
+                    if hash160(pubkey.sec()) == pkh:
+                        return pubkey
 
         return None
 

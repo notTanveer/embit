@@ -1567,6 +1567,86 @@ class PSBT(EmbitBase):
                 counter += 1
                 self._update_tx_modifiable(inp_sighash)
 
+        # After signing all inputs, handle SP ECDH/DLEQ generation
+        if self.version == 2 and any(out.sp_data is not None for out in self.outputs):
+            counter += self._sign_with_sp(root)
+
+        return counter
+
+    def _sign_with_sp(self, root) -> int:
+        """Compute per-input ECDH shares and DLEQ proofs for SP outputs."""
+        # Collect unique scan keys from SP outputs
+        scan_keys = {}
+        for out in self.outputs:
+            if out.sp_data is not None:
+                sk_bytes = out.sp_data.scan_key.sec()
+                if sk_bytes not in scan_keys:
+                    scan_keys[sk_bytes] = out.sp_data.scan_key
+
+        if not scan_keys:
+            return 0
+
+        # Get eligible inputs; raises SPValidationError on P2TR with SP outputs
+        try:
+            eligible = psbtv2_sp.get_eligible_inputs(self.inputs, has_sp_outputs=True)
+        except psbtv2_sp.SPValidationError:
+            return 0
+
+        if not eligible:
+            return 0
+
+        # Extract fingerprint — mirrors sign_with() key-extraction logic
+        fingerprint = None
+        if hasattr(root, "origin"):
+            if not getattr(root, "is_private", True):
+                return 0
+            if getattr(root, "is_extended", False):
+                fingerprint = root.fingerprint
+        if not fingerprint and hasattr(root, "my_fingerprint"):
+            fingerprint = root.my_fingerprint
+
+        counter = 0
+
+        for i in eligible:
+            inp = self.inputs[i]
+
+            # Derive this input's private key via bip32_derivations
+            priv_bytes = None
+            if fingerprint:
+                for pub, derivation in inp.bip32_derivations.items():
+                    if derivation.fingerprint != fingerprint:
+                        continue
+                    der = derivation.derivation
+                    if hasattr(root, "origin"):
+                        if root.origin:
+                            prefix = root.origin.derivation
+                            if der[: len(prefix)] != prefix:
+                                continue
+                            der = der[len(prefix) :]
+                        hdkey = root.key.derive(der)
+                    else:
+                        hdkey = root.derive(der)
+                    if hdkey.xonly() != pub.xonly():
+                        continue
+                    priv_bytes = hdkey.key.secret
+                    break
+
+            if priv_bytes is None:
+                continue
+
+            # Compute ECDH share and DLEQ proof for each unique scan key
+            for sk_bytes, scan_key in scan_keys.items():
+                if sk_bytes in inp.sp_ecdh_shares:
+                    continue  # already present
+                try:
+                    share = psbtv2_sp.compute_ecdh_share(priv_bytes, scan_key)
+                    proof = psbtv2_sp.compute_dleq_proof(priv_bytes, scan_key, share)
+                    inp.sp_ecdh_shares[sk_bytes] = share
+                    inp.sp_dleq_proofs[sk_bytes] = proof
+                    counter += 1
+                except psbtv2_sp.SPFieldError:
+                    continue
+
         return counter
 
     def _update_tx_modifiable(self, inp_sighash: int) -> None:

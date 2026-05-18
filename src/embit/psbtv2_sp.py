@@ -274,6 +274,21 @@ def get_eligible_inputs(
     return eligible
 
 
+def sign_sp_psbt(psbt, root_key) -> int:
+    """
+    Sign an SP PSBTv2. Returns total fields added
+    (signatures + ecdh_shares + dleq_proofs).
+    Raises SPValidationError if the PSBT is invalid for SP signing.
+    """
+    if psbt.version != 2:
+        raise SPValidationError("SP signing requires PSBTv2")
+    if not any(out.sp_data is not None for out in psbt.outputs):
+        raise SPValidationError("No SP outputs found in PSBT")
+    # Raises SPValidationError if P2TR inputs are present with SP outputs
+    get_eligible_inputs(psbt.inputs, has_sp_outputs=True)
+    return psbt.sign_with(root_key)
+
+
 def derive_silent_payment_outputs(
     ecdh_share: bytes,
     recipients: List[Tuple[ec.PublicKey, ec.PublicKey, int]],
