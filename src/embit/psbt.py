@@ -18,9 +18,6 @@ from .base import EmbitBase, EmbitError
 from binascii import b2a_base64, a2b_base64, hexlify, unhexlify
 from io import BytesIO
 
-# Import SP module - must come after other imports to avoid circular deps
-from . import psbtv2_sp
-
 LOCKTIME_THRESHOLD = 500000000
 
 
@@ -1751,3 +1748,7 @@ class PSBT(EmbitBase):
         self.outputs.append(output_scope)
         if self.version == 2:
             self._raw_output_count_from_global = len(self.outputs)
+
+
+# Deferred import to avoid circular dependency (psbtv2_sp imports InputScope from this module)
+from . import psbtv2_sp

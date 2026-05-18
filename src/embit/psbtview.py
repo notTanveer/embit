@@ -413,7 +413,7 @@ class PSBTView:
 
         self.seek_to_scope(self.num_inputs + i)
         v = self.get_value(b"\x03", from_current=True)
-        value = _signed_from_bytes(v)
+        value = int.from_bytes(v, "little")
 
         self.seek_to_scope(self.num_inputs + i)
         v = self.get_value(b"\x04", from_current=True)

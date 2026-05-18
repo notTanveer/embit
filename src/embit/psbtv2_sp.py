@@ -8,7 +8,7 @@ This module provides support for Silent Payments in PSBTv2 format, including:
 - Comprehensive validation according to BIP-375 specification
 """
 
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Tuple, Optional, TYPE_CHECKING
 
 from . import ec
 from . import hashes
@@ -23,7 +23,8 @@ from .util.secp256k1 import (
     ec_pubkey_tweak_add,
 )
 
-from .psbt import InputScope
+if TYPE_CHECKING:
+    from .psbt import InputScope
 
 
 class SPFieldError(Exception):
