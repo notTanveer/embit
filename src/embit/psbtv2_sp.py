@@ -20,7 +20,10 @@ from .util.secp256k1 import (
     ec_pubkey_tweak_mul,
     EC_COMPRESSED,
     ec_seckey_verify,
+    ec_pubkey_tweak_add,
 )
+
+from .psbt import InputScope
 
 
 class SPFieldError(Exception):

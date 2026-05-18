@@ -613,12 +613,13 @@ class InputScope(PSBTScope):
             r += ser_string(stream, self.taproot_merkle_root)
 
         # BIP-375 SP fields
-        for scan_key in self.sp_ecdh_shares:
-            r += ser_string(stream, b"\x1d" + scan_key)
-            r += ser_string(stream, self.sp_ecdh_shares[scan_key])
-        for scan_key in self.sp_dleq_proofs:
-            r += ser_string(stream, b"\x1e" + scan_key)
-            r += ser_string(stream, self.sp_dleq_proofs[scan_key])
+        if version == 2:
+            for scan_key in self.sp_ecdh_shares:
+                r += ser_string(stream, b"\x1d" + scan_key)
+                r += ser_string(stream, self.sp_ecdh_shares[scan_key])
+            for scan_key in self.sp_dleq_proofs:
+                r += ser_string(stream, b"\x1e" + scan_key)
+                r += ser_string(stream, self.sp_dleq_proofs[scan_key])
 
         # unknown
         for key in self.unknown:
