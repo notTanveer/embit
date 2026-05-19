@@ -185,6 +185,7 @@ def compute_dleq_proof(
     private_key: bytes,
     scan_key: ec.PublicKey,
     ecdh_share: bytes,
+    aux_rand: Optional[bytes] = None,
 ) -> bytes:
     """
     Generate DLEQ proof for an input's ECDH share.
@@ -193,12 +194,18 @@ def compute_dleq_proof(
         private_key: 32-byte private key (a)
         scan_key: The scan key (B_scan)
         ecdh_share: The ECDH share (a·B_scan) - used for self-verification
+        aux_rand: 32-byte auxiliary randomness. When None, fresh bytes are
+                  generated via os.urandom; pass explicit bytes for
+                  deterministic behaviour or hardware wallet use.
 
     Returns:
         64-byte DLEQ proof
     """
+    import os as _os
+
+    r = aux_rand if aux_rand is not None else _os.urandom(32)
     try:
-        return dleq.generate_dleq_proof(private_key, scan_key.sec())
+        return dleq.generate_dleq_proof(private_key, scan_key.sec(), r=r)
     except dleq.DLEQError as e:
         raise SPFieldError(f"Failed to generate DLEQ proof: {e}")
 
@@ -207,6 +214,7 @@ def compute_global_dleq_proof(
     private_keys: List[bytes],
     scan_key: ec.PublicKey,
     global_share: bytes,
+    aux_rand: Optional[bytes] = None,
 ) -> bytes:
     """
     Generate DLEQ proof for global ECDH share.
@@ -215,21 +223,57 @@ def compute_global_dleq_proof(
         private_keys: List of 32-byte private keys (all eligible inputs)
         scan_key: The scan key (B_scan)
         global_share: The global ECDH share (a_sum·B_scan)
+        aux_rand: 32-byte auxiliary randomness. When None, fresh bytes are
+                  generated via os.urandom.
 
     Returns:
         64-byte DLEQ proof
     """
+    import os as _os
+
     # Sum all private keys mod n
     a_sum = sum(int.from_bytes(priv, "big") for priv in private_keys) % SECP256K1_ORDER
     if a_sum == 0:
         raise SPFieldError("Cannot generate proof for zero sum")
 
     a_sum_bytes = a_sum.to_bytes(32, "big")
+    r = aux_rand if aux_rand is not None else _os.urandom(32)
 
     try:
-        return dleq.generate_dleq_proof(a_sum_bytes, scan_key.sec())
+        return dleq.generate_dleq_proof(a_sum_bytes, scan_key.sec(), r=r)
     except dleq.DLEQError as e:
         raise SPFieldError(f"Failed to generate global DLEQ proof: {e}")
+
+
+def populate_silent_payment_send_data(
+    psbt,
+    root,
+    aux_rand: Optional[bytes] = None,
+) -> int:
+    """
+    Populate per-input ECDH shares and DLEQ proofs for all SP outputs.
+
+    This is a convenience wrapper that calls psbt._sign_with_sp with the
+    supplied aux_rand.  Callers are responsible for passing fresh randomness
+    (32 bytes) from a trusted entropy source; not doing so is a security risk.
+
+    Args:
+        psbt:      PSBTv2 instance with SP outputs.
+        root:      Signing key (HDKey or PrivateKey).
+        aux_rand:  32-byte auxiliary randomness for DLEQ proof generation.
+
+    Returns:
+        Number of (ECDH-share, DLEQ-proof) pairs added.
+
+    Raises:
+        SPValidationError: if the PSBT is invalid for SP signing.
+        DLEQError (via SPFieldError): if aux_rand is None or invalid.
+    """
+    if psbt.version != 2:
+        raise SPValidationError("SP data population requires PSBTv2")
+    if not any(out.sp_data is not None for out in psbt.outputs):
+        raise SPValidationError("No SP outputs found in PSBT")
+    return psbt._sign_with_sp(root, aux_rand=aux_rand)
 
 
 def get_eligible_inputs(

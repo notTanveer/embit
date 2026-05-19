@@ -1571,7 +1571,7 @@ class PSBT(EmbitBase):
 
         return counter
 
-    def _sign_with_sp(self, root) -> int:
+    def _sign_with_sp(self, root, aux_rand=None) -> int:
         """Compute per-input ECDH shares and DLEQ proofs for SP outputs."""
         # Collect unique scan keys from SP outputs
         scan_keys = {}
@@ -1629,6 +1629,15 @@ class PSBT(EmbitBase):
                     priv_bytes = hdkey.key.secret
                     break
 
+            # Fallback: raw PrivateKey that directly signs this input's script
+            if priv_bytes is None and fingerprint is None and hasattr(root, "secret"):
+                sp = inp.script_pubkey
+                if sp is not None:
+                    root_pub = root.get_public_key()
+                    pkh = hashes.hash160(root_pub.sec())
+                    if root_pub.sec() in sp.data or pkh in sp.data:
+                        priv_bytes = root.secret
+
             if priv_bytes is None:
                 continue
 
@@ -1638,7 +1647,9 @@ class PSBT(EmbitBase):
                     continue  # already present
                 try:
                     share = psbtv2_sp.compute_ecdh_share(priv_bytes, scan_key)
-                    proof = psbtv2_sp.compute_dleq_proof(priv_bytes, scan_key, share)
+                    proof = psbtv2_sp.compute_dleq_proof(
+                        priv_bytes, scan_key, share, aux_rand=aux_rand
+                    )
                     inp.sp_ecdh_shares[sk_bytes] = share
                     inp.sp_dleq_proofs[sk_bytes] = proof
                     counter += 1
@@ -1748,6 +1759,83 @@ class PSBT(EmbitBase):
         self.outputs.append(output_scope)
         if self.version == 2:
             self._raw_output_count_from_global = len(self.outputs)
+
+
+class PSBTSigner:
+    """
+    High-level signing wrapper for PSBTs with Silent Payment outputs.
+
+    Orchestrates the BIP-375 signing sequence:
+      1. Discard any incoming SP fields (untrusted).
+      2. Populate fresh ECDH shares + DLEQ proofs with caller-supplied entropy.
+      3. Run full BIP-375 structural validation.
+      4. Sign all inputs normally.
+      5. Trim metadata while preserving SP fields for transmission.
+    """
+
+    def __init__(self, psbt):
+        self.psbt = psbt
+
+    def _sp_aux_rand(self):
+        """Return 32 bytes of fresh auxiliary randomness for DLEQ proof generation."""
+        import os as _os
+
+        return _os.urandom(32)
+
+    def _populate_silent_payment_outputs(self, root, aux_rand=None):
+        """
+        Discard incoming SP fields then compute fresh ECDH shares + DLEQ proofs.
+
+        Args:
+            root:     Signing key (HDKey or PrivateKey).
+            aux_rand: 32-byte auxiliary randomness. Defaults to _sp_aux_rand().
+
+        Returns:
+            Number of (ECDH-share, DLEQ-proof) pairs added.
+        """
+        # Clear any SP fields from the incoming PSBT (do not trust them).
+        for inp in self.psbt.inputs:
+            inp.sp_ecdh_shares = OrderedDict()
+            inp.sp_dleq_proofs = OrderedDict()
+        self.psbt.sp_ecdh_shares = OrderedDict()
+        self.psbt.sp_dleq_proofs = OrderedDict()
+
+        if aux_rand is None:
+            aux_rand = self._sp_aux_rand()
+        return self.psbt._sign_with_sp(root, aux_rand=aux_rand)
+
+    def sign(self, root, sighash=SIGHASH.DEFAULT):
+        """
+        Sign the PSBT, handling SP outputs correctly.
+
+        For PSBTs with SP outputs:
+          - Discards untrusted SP fields from the incoming PSBT.
+          - Populates fresh ECDH shares + DLEQ proofs.
+          - Validates BIP-375 structure (raises SPValidationError on failure).
+          - Signs all inputs.
+
+        Returns number of signatures (+ SP field pairs) added.
+        Raises psbtv2_sp.SPValidationError if the PSBT is not valid for SP signing.
+        """
+        has_sp = any(out.sp_data is not None for out in self.psbt.outputs)
+
+        if has_sp:
+            if self.psbt.version != 2:
+                raise psbtv2_sp.SPValidationError("SP signing requires PSBTv2")
+
+            # P2TR inputs with SP outputs are prohibited by BIP-375.
+            psbtv2_sp.get_eligible_inputs(self.psbt.inputs, has_sp_outputs=True)
+
+            sp_count = self._populate_silent_payment_outputs(root)
+
+            # Re-validate structure after populating SP fields.
+            from .bip375_validator import BIP375Validator
+
+            BIP375Validator(self.psbt).validate(skip_output_scripts=True)
+
+        # Sign inputs (sign_with also calls _sign_with_sp, but existing fields skip).
+        sig_count = self.psbt.sign_with(root, sighash=sighash)
+        return sig_count
 
 
 # Deferred import to avoid circular dependency (psbtv2_sp imports InputScope from this module)

@@ -8,8 +8,6 @@ Spec:     https://github.com/bitcoin/bips/blob/master/bip-0374.mediawiki
 Reference: https://github.com/bitcoin/bips/blob/master/bip-0374/reference.py
 """
 
-import os
-
 from . import hashes
 from .util.key import SECP256K1_ORDER, SECP256K1_G
 from .util.secp256k1 import (
@@ -99,10 +97,12 @@ def generate_dleq_proof(a_bytes, B_sec, r=None, m=None, G=None):
         raise DLEQError("Invalid B_sec")
     C_compressed = ec_pubkey_serialize(C_internal, EC_COMPRESSED)
 
-    if r is not None and len(r) != 32:
-        raise DLEQError("r must be 32 bytes")
     if r is None:
-        r = os.urandom(32)
+        raise DLEQError(
+            "r must be provided: pass 32 bytes of fresh auxiliary randomness"
+        )
+    if len(r) != 32:
+        raise DLEQError("r must be 32 bytes")
 
     aux_hash = hashes.tagged_hash(DLEQ_TAG_AUX, r)
     t_int = a_int ^ int.from_bytes(aux_hash, "big")
