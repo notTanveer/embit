@@ -13,15 +13,19 @@ from typing import Dict, List, Tuple, Optional, TYPE_CHECKING
 from . import ec
 from . import hashes
 from . import dleq
+from . import bip352
 from .util.key import SECP256K1_ORDER
 from .util.secp256k1 import (
     ec_pubkey_parse,
     ec_pubkey_serialize,
     ec_pubkey_tweak_mul,
+    ec_pubkey_combine,
+    ec_pubkey_tweak_add,
     EC_COMPRESSED,
     ec_seckey_verify,
     ec_pubkey_tweak_add,
 )
+from .script import p2tr
 
 if TYPE_CHECKING:
     from .psbt import InputScope
@@ -399,3 +403,187 @@ def derive_silent_payment_outputs(
         k += 1
 
     return result
+
+
+def _parse_sp_recipient(recipient_address: str):
+    """Decode a silent payment address into scan/spend keys."""
+    try:
+        return bip352.decode_silent_payment_address(recipient_address)
+    except Exception as e:
+        raise SPValidationError(f"Invalid silent payment recipient address: {e}")
+
+
+def _combine_shares(shares: List[bytes]) -> bytes:
+    """Combine multiple compressed ECDH share points into one compressed point."""
+    if not shares:
+        raise SPValidationError("Cannot combine empty ECDH share set")
+    if len(shares) == 1:
+        return shares[0]
+
+    acc = ec_pubkey_parse(shares[0])
+    for share in shares[1:]:
+        acc = ec_pubkey_combine(acc, ec_pubkey_parse(share))
+    return ec_pubkey_serialize(acc, EC_COMPRESSED)
+
+
+def populate_silent_payment_send_data(
+    psbt,
+    recipients: List[Tuple[int, str, Optional[int]]],
+    input_private_keys: Dict[int, bytes],
+    include_global_fields: bool = True,
+    include_input_fields: bool = False,
+    set_output_scripts: bool = True,
+) -> Dict[int, bytes]:
+    """
+    Populate BIP-375 Silent Payment send fields and derived outputs in a PSBTv2.
+
+    Args:
+        psbt: PSBTv2 instance to update in-place.
+        recipients: List of tuples `(output_index, sp_address, label)`.
+            - `output_index`: target PSBT output index to annotate/derive.
+            - `sp_address`: recipient Silent Payment address.
+            - `label`: optional uint32 label (or None).
+        input_private_keys: Mapping of input index -> 32-byte private key for
+            eligible inputs.
+        include_global_fields: Whether to populate
+            PSBT_GLOBAL_SP_ECDH_SHARE / PSBT_GLOBAL_SP_DLEQ.
+        include_input_fields: Whether to populate
+            PSBT_IN_SP_ECDH_SHARE / PSBT_IN_SP_DLEQ on eligible inputs.
+        set_output_scripts: Whether to set PSBT_OUT_SCRIPT from derived key.
+
+    Returns:
+        Dict mapping output index -> derived xonly output key (32 bytes).
+
+    Raises:
+        SPValidationError: If input validation fails or derivation cannot be
+            completed safely.
+        SPFieldError: For malformed key material.
+    """
+    if psbt.version != 2:
+        raise SPValidationError("Silent Payment send fields require PSBTv2")
+    if not recipients:
+        raise SPValidationError("At least one recipient is required")
+    if not include_global_fields and not include_input_fields:
+        raise SPValidationError(
+            "At least one of global or per-input SP fields must be populated"
+        )
+
+    output_count = len(psbt.outputs)
+    recipient_rows = []
+    seen_output_indexes = set()
+
+    for output_index, address, label in recipients:
+        if output_index < 0 or output_index >= output_count:
+            raise SPValidationError(
+                f"Recipient output index {output_index} is out of range"
+            )
+        if output_index in seen_output_indexes:
+            raise SPValidationError(f"Duplicate recipient output index {output_index}")
+        seen_output_indexes.add(output_index)
+
+        if label is not None:
+            if not isinstance(label, int):
+                raise SPValidationError("Recipient label must be an int or None")
+            if label < 0 or label > 0xFFFFFFFF:
+                raise SPValidationError("Recipient label must be a uint32")
+
+        scan_key, spend_key = _parse_sp_recipient(address)
+        recipient_rows.append(
+            {
+                "output_index": output_index,
+                "scan_key": scan_key,
+                "spend_key": spend_key,
+                "label": label,
+            }
+        )
+
+    eligible_inputs = get_eligible_inputs(psbt.inputs, has_sp_outputs=True)
+    if not eligible_inputs:
+        raise SPValidationError("No eligible inputs for Silent Payment derivation")
+
+    eligible_privkeys = []
+    for inp_index in eligible_inputs:
+        if inp_index not in input_private_keys:
+            raise SPValidationError(
+                f"Missing private key for eligible input {inp_index}"
+            )
+        priv = input_private_keys[inp_index]
+        if not isinstance(priv, (bytes, bytearray)) or len(priv) != 32:
+            raise SPFieldError(f"Input {inp_index} private key must be 32 bytes")
+        if not ec_seckey_verify(bytes(priv)):
+            raise SPFieldError(f"Input {inp_index} private key is invalid")
+        eligible_privkeys.append(bytes(priv))
+
+    recipients_by_scan: Dict[bytes, List[dict]] = {}
+    for row in recipient_rows:
+        scan_key_bytes = row["scan_key"].sec()
+        recipients_by_scan.setdefault(scan_key_bytes, []).append(row)
+
+    derived_output_keys: Dict[int, bytes] = {}
+
+    for scan_key_bytes, scan_recipients in recipients_by_scan.items():
+        scan_key = scan_recipients[0]["scan_key"]
+
+        global_share = None
+        if include_global_fields:
+            global_share = compute_global_ecdh_share(eligible_privkeys, scan_key)
+            if global_share is None:
+                raise SPValidationError(
+                    "Global private key sum is zero; cannot derive Silent Payments"
+                )
+            psbt.sp_ecdh_shares[scan_key_bytes] = global_share
+            psbt.sp_dleq_proofs[scan_key_bytes] = compute_global_dleq_proof(
+                eligible_privkeys,
+                scan_key,
+                global_share,
+            )
+
+        per_input_shares = []
+        if include_input_fields:
+            for inp_index in eligible_inputs:
+                priv = input_private_keys[inp_index]
+                share = compute_ecdh_share(priv, scan_key)
+                proof = compute_dleq_proof(priv, scan_key, share)
+                psbt.inputs[inp_index].sp_ecdh_shares[scan_key_bytes] = share
+                psbt.inputs[inp_index].sp_dleq_proofs[scan_key_bytes] = proof
+                per_input_shares.append(share)
+
+        derivation_share = (
+            global_share
+            if global_share is not None
+            else _combine_shares(per_input_shares)
+        )
+
+        sorted_scan_recipients = sorted(
+            scan_recipients,
+            key=lambda r: r["spend_key"].sec(),
+        )
+
+        derived_for_scan = derive_silent_payment_outputs(
+            derivation_share,
+            [
+                (r["scan_key"], r["spend_key"], r["label"])
+                for r in sorted_scan_recipients
+            ],
+            shared_secret=derivation_share[1:33],
+        )
+
+        for pos, recipient_row in enumerate(sorted_scan_recipients):
+            output_index = recipient_row["output_index"]
+            output_scope = psbt.outputs[output_index]
+            xonly_key = derived_for_scan[pos]
+
+            output_scope.sp_data = SilentPaymentData(
+                recipient_row["scan_key"], recipient_row["spend_key"]
+            )
+            output_scope.sp_label = recipient_row["label"]
+            if set_output_scripts:
+                output_scope.script_pubkey = p2tr(ec.PublicKey.from_xonly(xonly_key))
+
+            derived_output_keys[output_index] = xonly_key
+
+    # If scripts are set for SP outputs, BIP-375 requires non-modifiable tx flags.
+    if set_output_scripts:
+        psbt.tx_modifiable_flags = 0
+
+    return derived_output_keys
