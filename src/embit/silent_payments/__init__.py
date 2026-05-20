@@ -7,6 +7,7 @@ Silent Payments support for embit.
 - ecdh:   ECDH share / DLEQ proof computation and input eligibility
 - outputs: BIP-375 PSBT population and output derivation helpers
 - validator: BIP-375 PSBT 4-stage validation pipeline
+- psbt: SP-aware scopes, PSBT subclass, and signing orchestrator
 """
 
 from . import bip352
@@ -28,6 +29,8 @@ from .ecdh import (
 from .outputs import (
     derive_silent_payment_outputs,
     populate_silent_payment_send_data,
+    populate_silent_payment_send_data_from_keys,
     sign_sp_psbt,
 )
 from .validator import BIP375Validator, validate_bip375_psbt
+from .psbt import SPInputScope, SPOutputScope, SilentPaymentsPSBT, SPSigner

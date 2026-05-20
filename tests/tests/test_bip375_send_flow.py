@@ -1,8 +1,13 @@
 from unittest import TestCase
 
-from embit import bip352, dleq, ec
-from embit.psbt import PSBT
-from embit.psbtv2_sp import SPValidationError, populate_silent_payment_send_data
+from embit import ec
+from embit.silent_payments import (
+    bip352,
+    dleq,
+    SilentPaymentsPSBT as PSBT,
+    SPValidationError,
+    populate_silent_payment_send_data_from_keys as populate_silent_payment_send_data,
+)
 from embit.script import Script, p2tr, p2wpkh
 from embit.transaction import Transaction, TransactionInput, TransactionOutput
 from embit.util.key import SECP256K1_ORDER
@@ -109,8 +114,12 @@ class BIP375SendFlowTest(TestCase):
         )
 
         self.assertEqual(derived1, derived2)
-        self.assertEqual(psbt1.outputs[0].script_pubkey.data, psbt2.outputs[0].script_pubkey.data)
-        self.assertEqual(psbt1.outputs[1].script_pubkey.data, psbt2.outputs[1].script_pubkey.data)
+        self.assertEqual(
+            psbt1.outputs[0].script_pubkey.data, psbt2.outputs[0].script_pubkey.data
+        )
+        self.assertEqual(
+            psbt1.outputs[1].script_pubkey.data, psbt2.outputs[1].script_pubkey.data
+        )
 
     def test_populate_send_data_generates_verifiable_global_dleq(self):
         psbt, input_private_keys = self._make_psbtv2_with_eligible_inputs()

@@ -160,10 +160,6 @@ class InputScope(PSBTScope):
         self.required_time_locktime = None
         self.required_height_locktime = None
 
-        # BIP-375 SP fields
-        self.sp_ecdh_shares = OrderedDict()  # scan_key -> ecdh_share (33 bytes)
-        self.sp_dleq_proofs = OrderedDict()  # scan_key -> dleq_proof (64 bytes)
-
         self.parse_unknowns()
 
     def clear_metadata(self, compress=CompressMode.CLEAR_ALL):
@@ -180,8 +176,6 @@ class InputScope(PSBTScope):
         else:
             if self.witness_utxo is not None:
                 self.non_witness_utxo = None
-        self.sp_ecdh_shares = OrderedDict()
-        self.sp_dleq_proofs = OrderedDict()
         self.bip32_derivations = OrderedDict()
         self.taproot_bip32_derivations = OrderedDict()
         self.taproot_internal_key = None
@@ -221,8 +215,6 @@ class InputScope(PSBTScope):
             if other.required_height_locktime is not None
             else self.required_height_locktime
         )
-        self.sp_ecdh_shares.update(other.sp_ecdh_shares)
-        self.sp_dleq_proofs.update(other.sp_dleq_proofs)
 
     @property
     def vin(self):
@@ -487,32 +479,6 @@ class InputScope(PSBTScope):
         elif k[0] == 0x18:
             self.taproot_merkle_root = v
 
-        # PSBT_IN_SP_ECDH_SHARE (BIP-375)
-        elif k[0] == 0x1D:
-            if version != 2:
-                raise PSBTError("PSBT_IN_SP_ECDH_SHARE not allowed in PSBTv0")
-            if len(k) != 34:  # 1 byte type + 33 bytes scan key
-                raise PSBTError("Invalid PSBT_IN_SP_ECDH_SHARE key length")
-            if len(v) != 33:
-                raise PSBTError("PSBT_IN_SP_ECDH_SHARE value must be 33 bytes")
-            scan_key = k[1:]
-            if scan_key in self.sp_ecdh_shares:
-                raise PSBTError("Duplicated PSBT_IN_SP_ECDH_SHARE for scan key")
-            self.sp_ecdh_shares[scan_key] = v
-
-        # PSBT_IN_SP_DLEQ (BIP-375)
-        elif k[0] == 0x1E:
-            if version != 2:
-                raise PSBTError("PSBT_IN_SP_DLEQ not allowed in PSBTv0")
-            if len(k) != 34:  # 1 byte type + 33 bytes scan key
-                raise PSBTError("Invalid PSBT_IN_SP_DLEQ key length")
-            if len(v) != 64:
-                raise PSBTError("PSBT_IN_SP_DLEQ value must be 64 bytes")
-            scan_key = k[1:]
-            if scan_key in self.sp_dleq_proofs:
-                raise PSBTError("Duplicated PSBT_IN_SP_DLEQ for scan key")
-            self.sp_dleq_proofs[scan_key] = v
-
         else:
             if k in self.unknown:
                 raise PSBTError("Duplicated key")
@@ -609,15 +575,6 @@ class InputScope(PSBTScope):
             r += ser_string(stream, b"\x18")
             r += ser_string(stream, self.taproot_merkle_root)
 
-        # BIP-375 SP fields
-        if version == 2:
-            for scan_key in self.sp_ecdh_shares:
-                r += ser_string(stream, b"\x1d" + scan_key)
-                r += ser_string(stream, self.sp_ecdh_shares[scan_key])
-            for scan_key in self.sp_dleq_proofs:
-                r += ser_string(stream, b"\x1e" + scan_key)
-                r += ser_string(stream, self.sp_dleq_proofs[scan_key])
-
         # unknown
         for key in self.unknown:
             r += ser_string(stream, key)
@@ -678,10 +635,6 @@ class OutputScope(PSBTScope):
         self.taproot_bip32_derivations = OrderedDict()
         self.taproot_internal_key = None
 
-        # BIP-375 SP fields
-        self.sp_data = None  # SilentPaymentData (PSBT_OUT_SP_V0_INFO)
-        self.sp_label = None  # uint32 label (PSBT_OUT_SP_V0_LABEL)
-
         self.parse_unknowns()
 
     def clear_metadata(self, compress=CompressMode.CLEAR_ALL):
@@ -694,8 +647,6 @@ class OutputScope(PSBTScope):
         self.bip32_derivations = OrderedDict()
         self.taproot_bip32_derivations = OrderedDict()
         self.taproot_internal_key = None
-        self.sp_data = None
-        self.sp_label = None
 
     def update(self, other):
         self.value = other.value if other.value is not None else self.value
@@ -706,8 +657,6 @@ class OutputScope(PSBTScope):
         self.bip32_derivations.update(other.bip32_derivations)
         self.taproot_bip32_derivations.update(other.taproot_bip32_derivations)
         self.taproot_internal_key = other.taproot_internal_key
-        self.sp_data = other.sp_data or self.sp_data
-        self.sp_label = other.sp_label if other.sp_label is not None else self.sp_label
 
     @property
     def vout(self):
@@ -776,29 +725,6 @@ class OutputScope(PSBTScope):
                 der = DerivationPath.read_from(b)
                 self.taproot_bip32_derivations[pub] = (leaf_hashes, der)
 
-        # PSBT_OUT_SP_V0_INFO (BIP-375)
-        elif k == b"\x09":
-            if version != 2:
-                raise PSBTError("PSBT_OUT_SP_V0_INFO not allowed in PSBTv0")
-            if len(v) != 66:
-                raise PSBTError("PSBT_OUT_SP_V0_INFO must be 66 bytes")
-            if self.sp_data is not None:
-                raise PSBTError("Duplicated PSBT_OUT_SP_V0_INFO")
-            try:
-                self.sp_data = psbtv2_sp.SilentPaymentData.parse(v)
-            except psbtv2_sp.SPFieldError as e:
-                raise PSBTError(f"Invalid PSBT_OUT_SP_V0_INFO: {e}")
-
-        # PSBT_OUT_SP_V0_LABEL (BIP-375)
-        elif k == b"\x0a":
-            if version != 2:
-                raise PSBTError("PSBT_OUT_SP_V0_LABEL not allowed in PSBTv0")
-            if len(v) != 4:
-                raise PSBTError("PSBT_OUT_SP_V0_LABEL must be 4 bytes")
-            if self.sp_label is not None:
-                raise PSBTError("Duplicated PSBT_OUT_SP_V0_LABEL")
-            self.sp_label = int.from_bytes(v, "little")
-
         else:
             if k in self.unknown:
                 raise PSBTError("Duplicated key")
@@ -840,14 +766,6 @@ class OutputScope(PSBTScope):
                 + b"".join(leaf_hashes)
                 + derivation.serialize(),
             )
-
-        # BIP-375 SP fields
-        if self.sp_data is not None:
-            r += ser_string(stream, b"\x09")
-            r += ser_string(stream, self.sp_data.serialize())
-        if self.sp_label is not None:
-            r += ser_string(stream, b"\x0a")
-            r += ser_string(stream, self.sp_label.to_bytes(4, "little"))
 
         # unknown
         for key in self.unknown:
@@ -911,10 +829,6 @@ class PSBT(EmbitBase):
 
         self.unknown = {} if unknown is None else unknown
         self.xpubs = OrderedDict()
-
-        # BIP-375 SP global fields
-        self.sp_ecdh_shares = OrderedDict()  # scan_key -> ecdh_share (33 bytes)
-        self.sp_dleq_proofs = OrderedDict()  # scan_key -> dleq_proof (64 bytes)
         self.parse_unknowns()
 
     def parse_tx(self, tx):
@@ -1044,6 +958,9 @@ class PSBT(EmbitBase):
         fee -= sum([out.value for out in self.tx.vout])
         return fee
 
+    def _write_extra_globals(self, stream) -> int:
+        return 0
+
     def write_to(self, stream) -> int:
         # magic bytes
         r = stream.write(self.MAGIC)
@@ -1079,14 +996,7 @@ class PSBT(EmbitBase):
             r += ser_string(stream, b"\xfb")
             r += ser_string(stream, self.version.to_bytes(4, "little"))
 
-            # BIP-375 SP global fields
-            for scan_key in self.sp_ecdh_shares:
-                r += ser_string(stream, b"\x07" + scan_key)
-                r += ser_string(stream, self.sp_ecdh_shares[scan_key])
-            for scan_key in self.sp_dleq_proofs:
-                r += ser_string(stream, b"\x08" + scan_key)
-                r += ser_string(stream, self.sp_dleq_proofs[scan_key])
-
+        r += self._write_extra_globals(stream)
         # unknown
         for key in self.unknown:
             r += ser_string(stream, key)
@@ -1313,26 +1223,6 @@ class PSBT(EmbitBase):
                     )
                     # Store count only; do not pre-allocate objects to avoid
                     # attacker-controlled memory exhaustion.
-            elif k[0] == 0x07 and len(k) == 34:  # PSBT_GLOBAL_SP_ECDH_SHARE
-                if self.version != 2:
-                    continue
-                v = self.unknown.pop(k)
-                if len(v) != 33:
-                    raise PSBTError("PSBT_GLOBAL_SP_ECDH_SHARE value must be 33 bytes")
-                scan_key = k[1:]
-                if scan_key in self.sp_ecdh_shares:
-                    raise PSBTError("Duplicated PSBT_GLOBAL_SP_ECDH_SHARE for scan key")
-                self.sp_ecdh_shares[scan_key] = v
-            elif k[0] == 0x08 and len(k) == 34:  # PSBT_GLOBAL_SP_DLEQ
-                if self.version != 2:
-                    continue
-                v = self.unknown.pop(k)
-                if len(v) != 64:
-                    raise PSBTError("PSBT_GLOBAL_SP_DLEQ value must be 64 bytes")
-                scan_key = k[1:]
-                if scan_key in self.sp_dleq_proofs:
-                    raise PSBTError("Duplicated PSBT_GLOBAL_SP_DLEQ for scan key")
-                self.sp_dleq_proofs[scan_key] = v
 
     def sighash(self, i, sighash=SIGHASH.ALL, **kwargs):
         inp = self.inputs[i]
@@ -1565,97 +1455,6 @@ class PSBT(EmbitBase):
                 counter += 1
                 self._update_tx_modifiable(inp_sighash)
 
-        # After signing all inputs, handle SP ECDH/DLEQ generation
-        if self.version == 2 and any(out.sp_data is not None for out in self.outputs):
-            counter += self._sign_with_sp(root)
-
-        return counter
-
-    def _sign_with_sp(self, root, aux_rand=None) -> int:
-        """Compute per-input ECDH shares and DLEQ proofs for SP outputs."""
-        # Collect unique scan keys from SP outputs
-        scan_keys = {}
-        for out in self.outputs:
-            if out.sp_data is not None:
-                sk_bytes = out.sp_data.scan_key.sec()
-                if sk_bytes not in scan_keys:
-                    scan_keys[sk_bytes] = out.sp_data.scan_key
-
-        if not scan_keys:
-            return 0
-
-        # Get eligible inputs; raises SPValidationError on P2TR with SP outputs
-        try:
-            eligible = psbtv2_sp.get_eligible_inputs(self.inputs, has_sp_outputs=True)
-        except psbtv2_sp.SPValidationError:
-            return 0
-
-        if not eligible:
-            return 0
-
-        # Extract fingerprint — mirrors sign_with() key-extraction logic
-        fingerprint = None
-        if hasattr(root, "origin"):
-            if not getattr(root, "is_private", True):
-                return 0
-            if getattr(root, "is_extended", False):
-                fingerprint = root.fingerprint
-        if not fingerprint and hasattr(root, "my_fingerprint"):
-            fingerprint = root.my_fingerprint
-
-        counter = 0
-
-        for i in eligible:
-            inp = self.inputs[i]
-
-            # Derive this input's private key via bip32_derivations
-            priv_bytes = None
-            if fingerprint:
-                for pub, derivation in inp.bip32_derivations.items():
-                    if derivation.fingerprint != fingerprint:
-                        continue
-                    der = derivation.derivation
-                    if hasattr(root, "origin"):
-                        if root.origin:
-                            prefix = root.origin.derivation
-                            if der[: len(prefix)] != prefix:
-                                continue
-                            der = der[len(prefix) :]
-                        hdkey = root.key.derive(der)
-                    else:
-                        hdkey = root.derive(der)
-                    if hdkey.xonly() != pub.xonly():
-                        continue
-                    priv_bytes = hdkey.key.secret
-                    break
-
-            # Fallback: raw PrivateKey that directly signs this input's script
-            if priv_bytes is None and fingerprint is None and hasattr(root, "secret"):
-                sp = inp.script_pubkey
-                if sp is not None:
-                    root_pub = root.get_public_key()
-                    pkh = hashes.hash160(root_pub.sec())
-                    if root_pub.sec() in sp.data or pkh in sp.data:
-                        priv_bytes = root.secret
-
-            if priv_bytes is None:
-                continue
-
-            # Compute ECDH share and DLEQ proof for each unique scan key
-            for sk_bytes, scan_key in scan_keys.items():
-                if sk_bytes in inp.sp_ecdh_shares:
-                    continue  # already present
-                try:
-                    share = psbtv2_sp.compute_ecdh_share(priv_bytes, scan_key)
-                    proof = psbtv2_sp.compute_dleq_proof(
-                        priv_bytes, scan_key, share, aux_rand=aux_rand
-                    )
-                    inp.sp_ecdh_shares[sk_bytes] = share
-                    inp.sp_dleq_proofs[sk_bytes] = proof
-                    counter += 1
-                except psbtv2_sp.SPFieldError:
-                    continue
-
         return counter
 
     def _update_tx_modifiable(self, inp_sighash: int) -> None:
@@ -1759,84 +1558,3 @@ class PSBT(EmbitBase):
         self.outputs.append(output_scope)
         if self.version == 2:
             self._raw_output_count_from_global = len(self.outputs)
-
-
-class PSBTSigner:
-    """
-    High-level signing wrapper for PSBTs with Silent Payment outputs.
-
-    Orchestrates the BIP-375 signing sequence:
-      1. Discard any incoming SP fields (untrusted).
-      2. Populate fresh ECDH shares + DLEQ proofs with caller-supplied entropy.
-      3. Run full BIP-375 structural validation.
-      4. Sign all inputs normally.
-      5. Trim metadata while preserving SP fields for transmission.
-    """
-
-    def __init__(self, psbt):
-        self.psbt = psbt
-
-    def _sp_aux_rand(self):
-        """Return 32 bytes of fresh auxiliary randomness for DLEQ proof generation."""
-        import os as _os
-
-        return _os.urandom(32)
-
-    def _populate_silent_payment_outputs(self, root, aux_rand=None):
-        """
-        Discard incoming SP fields then compute fresh ECDH shares + DLEQ proofs.
-
-        Args:
-            root:     Signing key (HDKey or PrivateKey).
-            aux_rand: 32-byte auxiliary randomness. Defaults to _sp_aux_rand().
-
-        Returns:
-            Number of (ECDH-share, DLEQ-proof) pairs added.
-        """
-        # Clear any SP fields from the incoming PSBT (do not trust them).
-        for inp in self.psbt.inputs:
-            inp.sp_ecdh_shares = OrderedDict()
-            inp.sp_dleq_proofs = OrderedDict()
-        self.psbt.sp_ecdh_shares = OrderedDict()
-        self.psbt.sp_dleq_proofs = OrderedDict()
-
-        if aux_rand is None:
-            aux_rand = self._sp_aux_rand()
-        return self.psbt._sign_with_sp(root, aux_rand=aux_rand)
-
-    def sign(self, root, sighash=SIGHASH.DEFAULT):
-        """
-        Sign the PSBT, handling SP outputs correctly.
-
-        For PSBTs with SP outputs:
-          - Discards untrusted SP fields from the incoming PSBT.
-          - Populates fresh ECDH shares + DLEQ proofs.
-          - Validates BIP-375 structure (raises SPValidationError on failure).
-          - Signs all inputs.
-
-        Returns number of signatures (+ SP field pairs) added.
-        Raises psbtv2_sp.SPValidationError if the PSBT is not valid for SP signing.
-        """
-        has_sp = any(out.sp_data is not None for out in self.psbt.outputs)
-
-        if has_sp:
-            if self.psbt.version != 2:
-                raise psbtv2_sp.SPValidationError("SP signing requires PSBTv2")
-
-            # P2TR inputs with SP outputs are prohibited by BIP-375.
-            psbtv2_sp.get_eligible_inputs(self.psbt.inputs, has_sp_outputs=True)
-
-            sp_count = self._populate_silent_payment_outputs(root)
-
-            # Re-validate structure after populating SP fields.
-            from .silent_payments.validator import BIP375Validator
-
-            BIP375Validator(self.psbt).validate(skip_output_scripts=True)
-
-        # Sign inputs (sign_with also calls _sign_with_sp, but existing fields skip).
-        sig_count = self.psbt.sign_with(root, sighash=sighash)
-        return sig_count
-
-
-# Deferred import to avoid circular dependency (silent_payments.ecdh imports InputScope from this module)
-from . import silent_payments as psbtv2_sp

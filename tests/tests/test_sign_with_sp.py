@@ -1,6 +1,11 @@
 from embit import bip32, ec
 from embit.silent_payments import dleq
-from embit.psbt import PSBT, DerivationPath, InputScope, OutputScope
+from embit.psbt import DerivationPath
+from embit.silent_payments import SilentPaymentsPSBT as PSBT
+from embit.silent_payments.psbt import (
+    SPInputScope as InputScope,
+    SPOutputScope as OutputScope,
+)
 from embit.silent_payments import (
     SPValidationError,
     SilentPaymentData,

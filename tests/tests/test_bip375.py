@@ -8,7 +8,8 @@ import unittest
 import json
 from pathlib import Path
 
-from embit.psbt import PSBT, PSBTError
+from embit.psbt import PSBTError
+from embit.silent_payments import SilentPaymentsPSBT as PSBT
 from embit.silent_payments.validator import validate_bip375_psbt
 from embit.silent_payments import (
     SPValidationError,
