@@ -8,9 +8,9 @@ Spec:     https://github.com/bitcoin/bips/blob/master/bip-0374.mediawiki
 Reference: https://github.com/bitcoin/bips/blob/master/bip-0374/reference.py
 """
 
-from . import hashes
-from .util.key import SECP256K1_ORDER, SECP256K1_G
-from .util.secp256k1 import (
+from .. import hashes
+from ..util.key import SECP256K1_ORDER, SECP256K1_G
+from ..util.secp256k1 import (
     ec_pubkey_create,
     ec_pubkey_parse,
     ec_pubkey_serialize,

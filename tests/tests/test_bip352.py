@@ -7,12 +7,11 @@ from binascii import unhexlify
 from unittest import TestCase
 
 import pytest
-from embit import bip352
+from embit.silent_payments import bip352
 from embit.ec import PrivateKey
 import os
 import json
 from embit.transaction import COutPoint
-
 
 BASIC_TEST_VECTORS = [
     {

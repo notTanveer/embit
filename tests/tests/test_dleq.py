@@ -3,7 +3,7 @@ from pathlib import Path
 from unittest import TestCase
 from binascii import unhexlify
 
-from embit.dleq import generate_dleq_proof, verify_dleq_proof, DLEQError
+from embit.silent_payments.dleq import generate_dleq_proof, verify_dleq_proof, DLEQError
 
 _DATA_DIR = Path(__file__).parent / "data"
 _GENERATE_CSV = _DATA_DIR / "test_vectors_generate_proof.csv"

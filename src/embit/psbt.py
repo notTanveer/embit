@@ -1829,7 +1829,7 @@ class PSBTSigner:
             sp_count = self._populate_silent_payment_outputs(root)
 
             # Re-validate structure after populating SP fields.
-            from .bip375_validator import BIP375Validator
+            from .silent_payments.validator import BIP375Validator
 
             BIP375Validator(self.psbt).validate(skip_output_scripts=True)
 
@@ -1838,5 +1838,5 @@ class PSBTSigner:
         return sig_count
 
 
-# Deferred import to avoid circular dependency (psbtv2_sp imports InputScope from this module)
-from . import psbtv2_sp
+# Deferred import to avoid circular dependency (silent_payments.ecdh imports InputScope from this module)
+from . import silent_payments as psbtv2_sp

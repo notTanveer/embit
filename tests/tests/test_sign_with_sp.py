@@ -1,6 +1,7 @@
-from embit import bip32, dleq, ec
+from embit import bip32, ec
+from embit.silent_payments import dleq
 from embit.psbt import PSBT, DerivationPath, InputScope, OutputScope
-from embit.psbtv2_sp import (
+from embit.silent_payments import (
     SPValidationError,
     SilentPaymentData,
     compute_ecdh_share,
@@ -174,7 +175,7 @@ class TestSignWithSP(TestCase):
 class TestGetInputPublicKey(TestCase):
 
     def _validator(self):
-        from embit.bip375_validator import BIP375Validator
+        from embit.silent_payments.validator import BIP375Validator
 
         # The method under test doesn't use self.psbt; supply a dummy.
         return BIP375Validator(PSBT.create_v2())

@@ -15,9 +15,10 @@ import unittest
 from collections import OrderedDict
 from pathlib import Path
 
-from embit import bip32, dleq, ec
+from embit import bip32, ec
+from embit.silent_payments import dleq
 from embit.psbt import PSBT, PSBTSigner, DerivationPath, InputScope, OutputScope
-from embit.psbtv2_sp import (
+from embit.silent_payments import (
     SPValidationError,
     SPFieldError,
     SilentPaymentData,

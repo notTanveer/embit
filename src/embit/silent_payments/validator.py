@@ -10,14 +10,12 @@ Implements the 4-stage validation pipeline for Silent Payments in PSBTs:
 
 from typing import List, Optional
 
-from . import ec
+from .. import ec
 from . import dleq
-from .psbtv2_sp import (
-    SPValidationError,
-    get_eligible_inputs,
-)
-from .transaction import SIGHASH
-from .script import p2tr
+from .fields import SPValidationError
+from .ecdh import get_eligible_inputs
+from ..transaction import SIGHASH
+from ..script import p2tr
 
 
 class BIP375Validator:
@@ -222,13 +220,13 @@ class BIP375Validator:
         if len(eligible_pubkeys) == 1:
             A_sum = eligible_pubkeys[0]
         else:
-            from .util.secp256k1 import ec_pubkey_combine, ec_pubkey_parse
+            from ..util.secp256k1 import ec_pubkey_combine, ec_pubkey_parse
 
             pubkey_handles = [ec_pubkey_parse(pk.sec()) for pk in eligible_pubkeys]
             result = pubkey_handles[0]
             for pk_handle in pubkey_handles[1:]:
                 result = ec_pubkey_combine(result, pk_handle)
-            from .util.secp256k1 import ec_pubkey_serialize, EC_COMPRESSED
+            from ..util.secp256k1 import ec_pubkey_serialize, EC_COMPRESSED
 
             A_sum = ec.PublicKey.parse(ec_pubkey_serialize(result, EC_COMPRESSED))
 
@@ -275,7 +273,7 @@ class BIP375Validator:
 
     def _get_input_public_key(self, inp, inp_idx: int) -> Optional[ec.PublicKey]:
         """Extract the input's signing public key using hash-matching against the UTXO script."""
-        from .hashes import hash160
+        from ..hashes import hash160
 
         script = inp.script_pubkey
         if script is None:
@@ -338,7 +336,7 @@ class BIP375Validator:
         - Verify script is correctly derived from SP data and ECDH shares
         - Verify sorting of outputs by scan/spend keys
         """
-        from .hashes import tagged_hash
+        from ..hashes import tagged_hash
 
         # Get eligible inputs
         eligible_inputs = get_eligible_inputs(self.psbt.inputs, has_sp_outputs=True)
@@ -364,7 +362,7 @@ class BIP375Validator:
             else:
                 # Sum per-input shares
                 share_sum = None
-                from .util.secp256k1 import (
+                from ..util.secp256k1 import (
                     ec_pubkey_combine,
                     ec_pubkey_parse,
                     ec_pubkey_serialize,
@@ -410,7 +408,7 @@ class BIP375Validator:
                 )
 
                 # P = spend_key + t_k
-                from .util.secp256k1 import (
+                from ..util.secp256k1 import (
                     ec_pubkey_parse,
                     ec_pubkey_tweak_add,
                     ec_pubkey_serialize,

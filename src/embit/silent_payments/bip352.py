@@ -5,13 +5,14 @@ see: https://github.com/bitcoin/bips/blob/master/bip-0352.mediawiki
 TODO:
 * Implement signing SP spends (once psbt format is settled).
 """
-from embit import bech32, ec
-from embit.util import secp256k1
-from embit.hashes import tagged_hash
+
+from .. import bech32, ec
+from ..util import secp256k1
+from ..hashes import tagged_hash
 from typing import Tuple, List, Dict
-from embit.util.key import SECP256K1_ORDER
-from embit.transaction import COutPoint
-from embit.util.secp256k1 import (
+from ..util.key import SECP256K1_ORDER
+from ..transaction import COutPoint
+from ..util.secp256k1 import (
     ec_pubkey_create,
     ec_pubkey_serialize,
     ec_pubkey_parse,
@@ -20,7 +21,7 @@ from embit.util.secp256k1 import (
     ec_seckey_verify,
     ec_privkey_negate,
 )
-from embit.script import p2tr
+from ..script import p2tr
 from binascii import hexlify, unhexlify
 
 

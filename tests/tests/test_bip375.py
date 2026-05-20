@@ -9,8 +9,8 @@ import json
 from pathlib import Path
 
 from embit.psbt import PSBT, PSBTError
-from embit.bip375_validator import validate_bip375_psbt
-from embit.psbtv2_sp import (
+from embit.silent_payments.validator import validate_bip375_psbt
+from embit.silent_payments import (
     SPValidationError,
     SPFieldError,
     SilentPaymentData,
@@ -293,7 +293,7 @@ class TestECDHComputations(unittest.TestCase):
 
     def test_compute_ecdh_share_single_key(self):
         """Test computing ECDH share for single key."""
-        from embit.psbtv2_sp import compute_ecdh_share
+        from embit.silent_payments import compute_ecdh_share
 
         priv = b"\x01" * 32
         scan_key = ec.PrivateKey(b"\x02" * 32).get_public_key()
@@ -306,7 +306,7 @@ class TestECDHComputations(unittest.TestCase):
 
     def test_compute_global_ecdh_share(self):
         """Test computing global ECDH share."""
-        from embit.psbtv2_sp import compute_global_ecdh_share
+        from embit.silent_payments import compute_global_ecdh_share
 
         privs = [b"\x01" * 32, b"\x02" * 32]
         scan_key = ec.PrivateKey(b"\x03" * 32).get_public_key()
@@ -319,19 +319,19 @@ class TestECDHComputations(unittest.TestCase):
 
     def test_dleq_proof_generation_and_verification(self):
         """Test DLEQ proof generation and verification."""
-        from embit.psbtv2_sp import compute_dleq_proof
+        from embit.silent_payments import compute_dleq_proof
 
         priv = b"\x01" * 32
         scan_key = ec.PrivateKey(b"\x02" * 32).get_public_key()
 
         # Generate share and proof
-        from embit.psbtv2_sp import compute_ecdh_share
+        from embit.silent_payments import compute_ecdh_share
 
         share = compute_ecdh_share(priv, scan_key)
         proof = compute_dleq_proof(priv, scan_key, share)
 
         # Verify proof
-        from embit import dleq
+        from embit.silent_payments import dleq
 
         pub_key = ec.PrivateKey(priv).get_public_key()
         C = ec.PublicKey.parse(share)
