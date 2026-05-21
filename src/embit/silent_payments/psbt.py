@@ -153,6 +153,32 @@ class SilentPaymentsPSBT(PSBT):
         self.sp_dleq_proofs = OrderedDict()  # scan_key -> dleq_proof (64 bytes)
         super().__init__(*args, **kwargs)
 
+    @classmethod
+    def _validate_v2_output(cls, out, i):
+        if out.value is None:
+            raise PSBTError(
+                "PSBTv2 output %d missing required PSBT_OUT_AMOUNT (0x03)" % i
+            )
+        if out.script_pubkey is None and getattr(out, "sp_data", None) is None:
+            raise PSBTError(
+                "PSBTv2 output %d missing required PSBT_OUT_SCRIPT (0x04)" % i
+            )
+
+    def add_output(self, output_scope):
+        if not self.is_outputs_modifiable():
+            raise PSBTError("Outputs are not modifiable")
+        if self.version == 2:
+            if output_scope.value is None:
+                raise PSBTError("PSBTv2 output must have PSBT_OUT_AMOUNT")
+            if (
+                output_scope.script_pubkey is None
+                and getattr(output_scope, "sp_data", None) is None
+            ):
+                raise PSBTError("PSBTv2 output must have PSBT_OUT_SCRIPT")
+        self.outputs.append(output_scope)
+        if self.version == 2:
+            self._raw_output_count_from_global = len(self.outputs)
+
     def parse_unknowns(self):
         super().parse_unknowns()
         for k in list(self.unknown):
