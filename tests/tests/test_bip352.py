@@ -7,7 +7,7 @@ from binascii import unhexlify
 from unittest import TestCase
 
 import pytest
-from embit import bip352
+from embit.silent_payments import bip352
 from embit.ec import PrivateKey
 from embit.networks import NETWORKS
 
@@ -44,23 +44,21 @@ class BIP352Test(TestCase):
             spend_priv_key = PrivateKey(unhexlify(test_vector["spend_priv_key"]))
             scan_priv_key = PrivateKey(unhexlify(test_vector["scan_priv_key"]))
             sp_address = bip352.generate_silent_payment_address(
-                scan_priv_key.get_public_key(), spend_priv_key.get_public_key()
+                scan_priv_key, spend_priv_key.get_public_key()
             )
             assert sp_address == test_vector["sp_address"]
 
     def test_generate_silent_payment_address_for_network(self):
         """Test network silent payment addrs should start with "tsp" """
         test_networks = [k for k in NETWORKS.keys() if k != "main"]
-        scan_pubkey = PrivateKey(
-            unhexlify(BASIC_TEST_VECTORS[0]["scan_priv_key"])
-        ).get_public_key()
+        scan_priv_key = PrivateKey(unhexlify(BASIC_TEST_VECTORS[0]["scan_priv_key"]))
         spend_pubkey = PrivateKey(
             unhexlify(BASIC_TEST_VECTORS[0]["spend_priv_key"])
         ).get_public_key()
 
         for network in test_networks:
             payment_addr = bip352.generate_silent_payment_address(
-                scan_pubkey, spend_pubkey, network=network
+                scan_priv_key, spend_pubkey, network=network
             )
             assert payment_addr.startswith("tsp")
 
@@ -71,8 +69,8 @@ class BIP352Test(TestCase):
         for label, address in zip(
             LABEL_TEST_VECTORS["labels"], LABEL_TEST_VECTORS["addresses"]
         ):
-            sp_address = bip352.generate_labeled_silent_payment_address(
-                scan_priv_key, spend_priv_key.get_public_key(), label
+            sp_address = bip352.generate_silent_payment_address(
+                scan_priv_key, spend_priv_key.get_public_key(), label=label
             )
             assert sp_address == address
 
@@ -82,20 +80,26 @@ class BIP352Test(TestCase):
         scan_priv_key = PrivateKey(unhexlify(LABEL_TEST_VECTORS["scan_priv_key"]))
         spend_pubkey = spend_priv_key.get_public_key()
 
-        with pytest.raises(TypeError):
-            # Label is required
-            bip352.generate_labeled_silent_payment_address(scan_priv_key, spend_pubkey)
-
         for bad_label in ["tenant 6102", b"I am bytes", 1.0, True]:
             with pytest.raises(TypeError):
                 # Label must be an int (and not a bool)
-                bip352.generate_labeled_silent_payment_address(
+                bip352.generate_silent_payment_address(
                     scan_priv_key, spend_pubkey, label=bad_label
                 )
 
         for bad_label in [0, -1, 0x100000000]:
             with pytest.raises(ValueError):
                 # m = 0 is reserved for change; values must fit in 32 bits
-                bip352.generate_labeled_silent_payment_address(
+                bip352.generate_silent_payment_address(
                     scan_priv_key, spend_pubkey, label=bad_label
                 )
+
+    def test_decode_silent_payment_address_round_trip(self):
+        """A generated address should decode back to its scan/spend pubkeys"""
+        spend_priv_key = PrivateKey(unhexlify(BASIC_TEST_VECTORS[0]["spend_priv_key"]))
+        scan_priv_key = PrivateKey(unhexlify(BASIC_TEST_VECTORS[0]["scan_priv_key"]))
+        address = BASIC_TEST_VECTORS[0]["sp_address"]
+
+        B_scan, B_spend = bip352.decode_silent_payment_address(address)
+        assert B_scan.sec() == scan_priv_key.get_public_key().sec()
+        assert B_spend.sec() == spend_priv_key.get_public_key().sec()
