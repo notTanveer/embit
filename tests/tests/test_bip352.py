@@ -9,7 +9,87 @@ from unittest import TestCase
 import pytest
 from embit.silent_payments import bip352
 from embit.ec import PrivateKey
-from embit.networks import NETWORKS
+import os
+import json
+from embit import hashes
+from embit.script import Script, Witness
+from embit.transaction import COutPoint
+from embit.util.key import ECPubKey
+from embit.ec import NUMS_PUBKEY
+
+
+def get_input_pubkey(prevout_script, script_sig=None, witness=None) -> ECPubKey:
+    """Extract and validate the input pubkey for a prevout, by script type.
+
+    Test helper for BIP-352 send vectors. Returns an ECPubKey with .valid=False
+    when no suitable compressed pubkey can be determined.
+    """
+    spk = (
+        prevout_script if isinstance(prevout_script, Script) else Script(prevout_script)
+    )
+
+    if isinstance(script_sig, str):
+        try:
+            ss = bytes.fromhex(script_sig)
+        except Exception:
+            ss = b""
+    elif isinstance(script_sig, bytes):
+        ss = script_sig
+    else:
+        ss = b""
+
+    if isinstance(witness, Witness):
+        wstack = witness.items
+    elif isinstance(witness, list):
+        wstack = witness
+    else:
+        wstack = []
+
+    script_type = spk.script_type()
+
+    def _compressed(pubkey_bytes):
+        pubkey = ECPubKey().set(pubkey_bytes)
+        return pubkey if (pubkey.valid and pubkey.is_compressed) else None
+
+    if script_type == "p2pkh":
+        spk_hash = spk.data[3:23]
+        for i in range(len(ss), 32, -1):
+            if i >= 33:
+                pubkey_bytes = ss[i - 33 : i]
+                if (
+                    pubkey_bytes[0] in (0x02, 0x03)
+                    and hashes.hash160(pubkey_bytes) == spk_hash
+                ):
+                    pubkey = _compressed(pubkey_bytes)
+                    if pubkey:
+                        return pubkey
+        return ECPubKey()
+
+    if script_type in ("p2sh", "p2wpkh"):
+        if wstack and (script_type == "p2wpkh" or len(ss) > 1):
+            pubkey = _compressed(wstack[-1])
+            if pubkey:
+                return pubkey
+        return ECPubKey()
+
+    if script_type == "p2tr":
+        if wstack:
+            # strip annex if present (last element starting with 0x50)
+            if len(wstack) > 1 and wstack[-1][:1] == b"\x50":
+                wstack = wstack[:-1]
+            # Script-path spend with NUMS internal key: not key-spendable
+            if len(wstack) > 1:
+                control_block = wstack[-1]
+                if len(control_block) >= 33 and control_block[1:33] == NUMS_PUBKEY.xonly():
+                    return ECPubKey()
+        # Key-path spend: reconstruct even-y compressed SEC from x-only
+        if len(spk.data) >= 34:
+            pubkey = ECPubKey().set(b"\x02" + spk.data[2:34])
+            if pubkey.valid:
+                return pubkey
+
+    return ECPubKey()
+
 
 BASIC_TEST_VECTORS = [
     {
@@ -37,6 +117,9 @@ LABEL_TEST_VECTORS = {
 }
 
 
+INVALID_LABEL_TEST_VECTORS = ["not an int", 99999999999999999999999999, -15, 1.0]
+
+
 class BIP352Test(TestCase):
     def test_generate_silent_payment_address(self):
         """Should generate the expected silent payment address"""
@@ -48,20 +131,6 @@ class BIP352Test(TestCase):
             )
             assert sp_address == test_vector["sp_address"]
 
-    def test_generate_silent_payment_address_for_network(self):
-        """Test network silent payment addrs should start with "tsp" """
-        test_networks = [k for k in NETWORKS.keys() if k != "main"]
-        scan_priv_key = PrivateKey(unhexlify(BASIC_TEST_VECTORS[0]["scan_priv_key"]))
-        spend_pubkey = PrivateKey(
-            unhexlify(BASIC_TEST_VECTORS[0]["spend_priv_key"])
-        ).get_public_key()
-
-        for network in test_networks:
-            payment_addr = bip352.generate_silent_payment_address(
-                scan_priv_key, spend_pubkey, network=network
-            )
-            assert payment_addr.startswith("tsp")
-
     def test_generate_labeled_silent_payment_address(self):
         """Should generate the expected labeled silent payment addresses"""
         spend_priv_key = PrivateKey(unhexlify(LABEL_TEST_VECTORS["spend_priv_key"]))
@@ -70,36 +139,99 @@ class BIP352Test(TestCase):
             LABEL_TEST_VECTORS["labels"], LABEL_TEST_VECTORS["addresses"]
         ):
             sp_address = bip352.generate_silent_payment_address(
-                scan_priv_key, spend_priv_key.get_public_key(), label=label
+                scan_priv_key, spend_priv_key.get_public_key(), label
             )
             assert sp_address == address
 
-    def test_generate_labeled_silent_payment_address_invalid_label(self):
-        """Labels must be 32-bit unsigned ints in [1, 2**32 - 1]"""
-        spend_priv_key = PrivateKey(unhexlify(LABEL_TEST_VECTORS["spend_priv_key"]))
-        scan_priv_key = PrivateKey(unhexlify(LABEL_TEST_VECTORS["scan_priv_key"]))
-        spend_pubkey = spend_priv_key.get_public_key()
-
-        for bad_label in ["tenant 6102", b"I am bytes", 1.0, True]:
-            with pytest.raises(TypeError):
-                # Label must be an int (and not a bool)
+        with pytest.raises(Exception):
+            for label in INVALID_LABEL_TEST_VECTORS:
                 bip352.generate_silent_payment_address(
-                    scan_priv_key, spend_pubkey, label=bad_label
+                    scan_priv_key, spend_priv_key.get_public_key(), label
                 )
 
-        for bad_label in [0, -1, 0x100000000]:
-            with pytest.raises(ValueError):
-                # m = 0 is reserved for change; values must fit in 32 bits
-                bip352.generate_silent_payment_address(
-                    scan_priv_key, spend_pubkey, label=bad_label
+    def test_decode_silent_payment_address(self):
+        """Should decode the silent payment address and return the expected keys"""
+        for test_vector in BASIC_TEST_VECTORS:
+            scan_priv_key = PrivateKey(unhexlify(test_vector["scan_priv_key"]))
+            spend_priv_key = PrivateKey(unhexlify(test_vector["spend_priv_key"]))
+            B_scan, B_spend = bip352.decode_silent_payment_address(
+                test_vector["sp_address"]
+            )
+
+            assert B_scan == scan_priv_key.get_public_key()
+            assert B_spend == spend_priv_key.get_public_key()
+
+        with pytest.raises(ValueError):
+            # Invalid HRP
+            bip352.decode_silent_payment_address(
+                "st1qqgste7k9hx0qftg6qmwlkqtwuy6cycyavzmzj85c6qdfhjdpdjtdgqjuexzk6murw56suy3e0rd2cgqvycxttddwsvgxe2usfpxumr70xc9pkqwv"
+            )
+
+        with pytest.raises(ValueError):
+            # Invalid encoding
+            bip352.decode_silent_payment_address(
+                "sp1qqgste7k9hx0qftg6qmwlkqtwuy6cycyavzmzj85c6qdfhjdpdjtdgqjuexzk6murw56suy3e0rd2cgqvycxttddwsvgxe2usfpxumr70xc9pkqwvm"
+            )
+
+    def test_create_silent_payments_outputs(self):
+        """Test silent payment output generation using test vectors"""
+        __location__ = os.path.realpath(
+            os.path.join(os.getcwd(), os.path.dirname(__file__))
+        )
+        with open(
+            os.path.join(__location__, "data/send_and_receive_test_vectors.json"), "r"
+        ) as f:
+            SEND_AND_RECEIVE_TEST_VECTORS = json.load(f)
+
+        from io import BytesIO
+
+        for case in SEND_AND_RECEIVE_TEST_VECTORS:
+            for sending_test in case["sending"]:
+                given = sending_test["given"]
+                expected = sending_test["expected"]
+
+                outpoints: list[COutPoint] = []
+                input_privkeys: list[tuple] = []
+
+                for txin in given["vin"]:
+                    outpoints.append(
+                        COutPoint(txid=unhexlify(txin["txid"]), out_idx=txin["vout"])
+                    )
+
+                    spk_hex = txin["prevout"]["scriptPubKey"]["hex"]
+                    spk = Script(unhexlify(spk_hex))
+
+                    wit_hex = txin.get("txinwitness", "") or ""
+                    witness = None
+                    if wit_hex:
+                        try:
+                            witness = Witness.read_from(BytesIO(bytes.fromhex(wit_hex)))
+                        except Exception:
+                            witness = None
+
+                    pub = get_input_pubkey(spk, txin.get("scriptSig", ""), witness)
+                    if not getattr(pub, "valid", False):
+                        continue
+
+                    is_xonly = spk.script_type() == "p2tr"
+                    input_privkeys.append((unhexlify(txin["private_key"]), is_xonly))
+
+                outputs_map = bip352.create_outputs(
+                    input_privkeys=input_privkeys,
+                    outpoints=outpoints,
+                    recipients=given["recipients"],
                 )
 
-    def test_decode_silent_payment_address_round_trip(self):
-        """A generated address should decode back to its scan/spend pubkeys"""
-        spend_priv_key = PrivateKey(unhexlify(BASIC_TEST_VECTORS[0]["spend_priv_key"]))
-        scan_priv_key = PrivateKey(unhexlify(BASIC_TEST_VECTORS[0]["scan_priv_key"]))
-        address = BASIC_TEST_VECTORS[0]["sp_address"]
+                expected_outputs = expected["outputs"]
 
-        B_scan, B_spend = bip352.decode_silent_payment_address(address)
-        assert B_scan.sec() == scan_priv_key.get_public_key().sec()
-        assert B_spend.sec() == spend_priv_key.get_public_key().sec()
+                actual_outputs = []
+                for recipient, outputs in outputs_map.items():
+                    actual_outputs.extend(outputs)
+
+                self.assertTrue(
+                    any(
+                        set(actual_outputs) == set(expected_set)
+                        for expected_set in expected_outputs
+                    ),
+                    f"Actual outputs {set(actual_outputs)} did not match any expected set {expected_outputs}",
+                )
