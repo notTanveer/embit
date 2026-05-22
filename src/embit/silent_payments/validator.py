@@ -186,10 +186,12 @@ class BIP375Validator:
                     if out.script_pubkey:  # Can verify only if complete
                         self._verify_input_dleq_proof(inp_idx, scan_key, out_idx)
 
-                    # Check BIP32 derivation for per-input DLEQ
+                    # Check BIP32 derivation for per-input DLEQ.  Only required
+                    # when the output script is absent: trimmed/finalized PSBTs
+                    # legitimately strip BIP32 derivations, and Stage 4 provides
+                    # equivalent verification via the output script in that case.
                     if scan_key_bytes in inp.sp_dleq_proofs:
-                        if len(inp.bip32_derivations) == 0:
-                            # Need at least one BIP32 derivation for public key
+                        if len(inp.bip32_derivations) == 0 and not out.script_pubkey:
                             raise SPValidationError(
                                 f"Output {out_idx}: Input {inp_idx} has DLEQ proof "
                                 f"but missing PSBT_IN_BIP32_DERIVATION"
@@ -272,7 +274,11 @@ class BIP375Validator:
             )
 
     def _get_input_public_key(self, inp, inp_idx: int) -> Optional[ec.PublicKey]:
-        """Extract the input's signing public key using hash-matching against the UTXO script."""
+        """Extract the input's signing public key using hash-matching against the UTXO script.
+
+        Falls back to partial_sigs keys when bip32_derivations is absent (e.g. a
+        trimmed PSBT where the signer stripped BIP-32 metadata to save space).
+        """
         from ..hashes import hash160
 
         script = inp.script_pubkey
@@ -287,11 +293,17 @@ class BIP375Validator:
             for pubkey in inp.bip32_derivations:
                 if hash160(pubkey.sec()) == pkh:
                     return pubkey
+            for pubkey in inp.partial_sigs:
+                if hash160(pubkey.sec()) == pkh:
+                    return pubkey
 
         elif script_type == "p2pkh":
             # script = 0x76 0xa9 0x14 <20-byte hash160(pubkey)> 0x88 0xac
             pkh = bytes(script.data[3:23])
             for pubkey in inp.bip32_derivations:
+                if hash160(pubkey.sec()) == pkh:
+                    return pubkey
+            for pubkey in inp.partial_sigs:
                 if hash160(pubkey.sec()) == pkh:
                     return pubkey
 
@@ -300,6 +312,9 @@ class BIP375Validator:
             if inp.redeem_script.script_type() == "p2wpkh":
                 pkh = bytes(inp.redeem_script.data[2:22])
                 for pubkey in inp.bip32_derivations:
+                    if hash160(pubkey.sec()) == pkh:
+                        return pubkey
+                for pubkey in inp.partial_sigs:
                     if hash160(pubkey.sec()) == pkh:
                         return pubkey
 
@@ -417,7 +432,7 @@ class BIP375Validator:
 
                 # Handle label
                 if label is not None and label != 0:
-                    label_bytes = label.to_bytes(4, "little")
+                    label_bytes = label.to_bytes(4, "big")
                     label_tweak = tagged_hash(
                         "BIP0352/Label", scan_key.sec() + label_bytes
                     )

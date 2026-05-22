@@ -74,7 +74,7 @@ def derive_silent_payment_outputs(
         # For labeled recipients, tweak the spend key
         if label is not None and label != 0:
             if isinstance(label, int):
-                label_bytes = label.to_bytes(4, "little")
+                label_bytes = label.to_bytes(4, "big")
             else:
                 label_bytes = label
 
