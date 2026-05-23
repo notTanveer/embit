@@ -34,3 +34,4 @@ from .outputs import (
 )
 from .validator import BIP375Validator, validate_bip375_psbt
 from .psbt import SPInputScope, SPOutputScope, SilentPaymentsPSBT, SPSigner
+from .finalizer import finalize_sp_spends

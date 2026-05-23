@@ -12,6 +12,7 @@ from collections import OrderedDict
 from .. import hashes
 from ..psbt import (
     PSBT,
+    DerivationPath,
     InputScope,
     OutputScope,
     PSBTError,
@@ -29,18 +30,24 @@ class SPInputScope(InputScope):
     def __init__(self, *args, **kwargs):
         self.sp_ecdh_shares = OrderedDict()  # scan_key -> ecdh_share (33 bytes)
         self.sp_dleq_proofs = OrderedDict()  # scan_key -> dleq_proof (64 bytes)
+        self.sp_spend_bip32_derivations = OrderedDict()  # pub_bytes -> DerivationPath
+        self.sp_tweak = None  # 32 bytes or None
         super().__init__(*args, **kwargs)
 
     def clear_metadata(self, *args, **kwargs):
         super().clear_metadata(*args, **kwargs)
         self.sp_ecdh_shares = OrderedDict()
         self.sp_dleq_proofs = OrderedDict()
+        self.sp_spend_bip32_derivations = OrderedDict()
+        self.sp_tweak = None
 
     def update(self, other):
         super().update(other)
         if isinstance(other, SPInputScope):
             self.sp_ecdh_shares.update(other.sp_ecdh_shares)
             self.sp_dleq_proofs.update(other.sp_dleq_proofs)
+            self.sp_spend_bip32_derivations.update(other.sp_spend_bip32_derivations)
+            self.sp_tweak = other.sp_tweak or self.sp_tweak
 
     def read_value(self, stream, k, version=None):
         if k[0] == 0x1D:  # PSBT_IN_SP_ECDH_SHARE (BIP-375)
@@ -67,6 +74,34 @@ class SPInputScope(InputScope):
             if scan_key in self.sp_dleq_proofs:
                 raise PSBTError("Duplicated PSBT_IN_SP_DLEQ for scan key")
             self.sp_dleq_proofs[scan_key] = v
+        elif k[0] == 0x1F:  # PSBT_IN_SP_SPEND_BIP32_DERIVATION (BIP-376)
+            v = read_string(stream)
+            if version != 2:
+                raise PSBTError(
+                    "PSBT_IN_SP_SPEND_BIP32_DERIVATION not allowed in PSBTv0"
+                )
+            if len(k) != 34:
+                raise PSBTError(
+                    "Invalid PSBT_IN_SP_SPEND_BIP32_DERIVATION key length"
+                )
+            pub_bytes = k[1:]
+            if pub_bytes in self.sp_spend_bip32_derivations:
+                raise PSBTError(
+                    "Duplicated PSBT_IN_SP_SPEND_BIP32_DERIVATION for pubkey"
+                )
+            import io
+            self.sp_spend_bip32_derivations[pub_bytes] = DerivationPath.read_from(
+                io.BytesIO(v)
+            )
+        elif k == b"\x20":  # PSBT_IN_SP_TWEAK (BIP-376)
+            v = read_string(stream)
+            if version != 2:
+                raise PSBTError("PSBT_IN_SP_TWEAK not allowed in PSBTv0")
+            if len(v) != 32:
+                raise PSBTError("PSBT_IN_SP_TWEAK value must be 32 bytes")
+            if self.sp_tweak is not None:
+                raise PSBTError("Duplicated PSBT_IN_SP_TWEAK")
+            self.sp_tweak = v
         else:
             super().read_value(stream, k, version=version)
 
@@ -79,6 +114,12 @@ class SPInputScope(InputScope):
             for scan_key in self.sp_dleq_proofs:
                 r += ser_string(stream, b"\x1e" + scan_key)
                 r += ser_string(stream, self.sp_dleq_proofs[scan_key])
+            for pub_bytes, derivation in self.sp_spend_bip32_derivations.items():
+                r += ser_string(stream, b"\x1f" + pub_bytes)
+                r += ser_string(stream, derivation.serialize())
+            if self.sp_tweak is not None:
+                r += ser_string(stream, b"\x20")
+                r += ser_string(stream, self.sp_tweak)
         if not skip_separator:
             r += stream.write(b"\x00")
         return r
@@ -221,6 +262,57 @@ class SilentPaymentsPSBT(PSBT):
             counter = super().sign_with(root, **kwargs)
         if self.version == 2 and any(out.sp_data is not None for out in self.outputs):
             counter += self._sign_with_sp(root)
+        if self.version == 2:
+            counter += self._sign_sp_spends(root)
+        return counter
+
+    def _sign_sp_spends(self, root) -> int:
+        """BIP-376: sign inputs that carry sp_tweak using sp_spend_bip32_derivations."""
+        fingerprint = None
+        if hasattr(root, "origin"):
+            if not getattr(root, "is_private", True):
+                return 0
+            if getattr(root, "is_extended", False):
+                fingerprint = root.fingerprint
+        if not fingerprint and hasattr(root, "my_fingerprint"):
+            fingerprint = root.my_fingerprint
+
+        counter = 0
+        for i, inp in enumerate(self.inputs):
+            if getattr(inp, "sp_tweak", None) is None:
+                continue
+            if inp.taproot_key_sig is not None:
+                continue
+
+            priv_key = None
+
+            if fingerprint:
+                for pub_bytes, derivation in inp.sp_spend_bip32_derivations.items():
+                    if derivation.fingerprint != fingerprint:
+                        continue
+                    der = derivation.derivation
+                    if hasattr(root, "origin"):
+                        if root.origin:
+                            prefix = root.origin.derivation
+                            if der[: len(prefix)] != prefix:
+                                continue
+                            der = der[len(prefix) :]
+                        hdkey = root.key.derive(der)
+                    else:
+                        hdkey = root.derive(der)
+                    if hdkey.xonly() != pub_bytes[1:]:
+                        continue
+                    priv_key = hdkey.key
+                    break
+
+            if priv_key is None and fingerprint is None and hasattr(root, "secret"):
+                priv_key = root
+
+            if priv_key is None:
+                continue
+
+            counter += self.sign_input_with_sp_tweak(priv_key, i, inp)
+
         return counter
 
     def _sign_with_sp(self, root, aux_rand=None) -> int:

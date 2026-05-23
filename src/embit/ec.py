@@ -180,6 +180,18 @@ class PrivateKey(EmbitKey):
             pk = PrivateKey(secp256k1.ec_privkey_negate(res))
         return pk
 
+    def sp_spend_tweak(self, tweak: bytes):
+        """BIP-376: apply raw 32-byte SP tweak without pre-negation or tagged hash."""
+        if len(tweak) != 32:
+            raise EmbitError("SP tweak must be 32 bytes")
+        if not secp256k1.ec_seckey_verify(tweak):
+            raise EmbitError("SP tweak is not valid")
+        res = secp256k1.ec_privkey_add(self._secret, tweak)
+        pk = PrivateKey(res)
+        if pk.sec()[0] == 0x03:
+            pk = PrivateKey(secp256k1.ec_privkey_negate(res))
+        return pk
+
     @classmethod
     def from_wif(cls, s):
         """Import private key from Wallet Import Format string."""
