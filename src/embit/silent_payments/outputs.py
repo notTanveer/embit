@@ -11,11 +11,13 @@ from ..util.secp256k1 import (
     ec_pubkey_parse,
     ec_pubkey_serialize,
     ec_pubkey_tweak_add,
+    ec_pubkey_tweak_mul,
     ec_pubkey_combine,
+    ec_pubkey_create,
     EC_COMPRESSED,
     ec_seckey_verify,
 )
-from ..script import p2tr
+from ..script import Script
 from .fields import SilentPaymentData, SPFieldError, SPValidationError
 from .ecdh import (
     compute_ecdh_share,
@@ -24,6 +26,8 @@ from .ecdh import (
     compute_global_dleq_proof,
     get_eligible_inputs,
 )
+from ..transaction import COutPoint
+from ..util.key import SECP256K1_ORDER
 
 
 def sign_sp_psbt(psbt, root_key) -> int:
@@ -62,10 +66,9 @@ def derive_silent_payment_outputs(
     if not recipients:
         return {}
 
-    # Use precomputed or compute from ECDH share
+    # Use precomputed or default to the full 33-byte compressed point (BIP-352 §1)
     if shared_secret is None:
-        # Extract xonly from ECDH share (skip first byte marker)
-        shared_secret = ecdh_share[1:33]
+        shared_secret = ecdh_share
 
     result = {}
     k = 0
@@ -235,6 +238,19 @@ def populate_silent_payment_send_data_from_keys(
             raise SPFieldError(f"Input {inp_index} private key is invalid")
         eligible_privkeys.append(bytes(priv))
 
+    # Compute input_hash = hash(lowest_outpoint || A_sum) per BIP-352.
+    # This is the same for every scan-key group, so compute it once.
+    outpoints = [
+        COutPoint(txid=psbt.tx.vin[i].txid, out_idx=psbt.tx.vin[i].vout)
+        for i in eligible_inputs
+    ]
+    a_sum = (
+        sum(int.from_bytes(priv, "big") for priv in eligible_privkeys) % SECP256K1_ORDER
+    )
+    a_sum_bytes = a_sum.to_bytes(32, "big")
+    A_sum_bytes = ec_pubkey_serialize(ec_pubkey_create(a_sum_bytes), EC_COMPRESSED)
+    input_hash = bip352.get_input_hash(outpoints, A_sum_bytes)
+
     recipients_by_scan: Dict[bytes, List[dict]] = {}
     for row in recipient_rows:
         scan_key_bytes = row["scan_key"].sec()
@@ -275,18 +291,22 @@ def populate_silent_payment_send_data_from_keys(
             else _combine_shares(per_input_shares)
         )
 
+        # Apply input_hash: adjusted = input_hash · derivation_share (BIP-352)
+        adjusted_handle = ec_pubkey_parse(derivation_share)
+        ec_pubkey_tweak_mul(adjusted_handle, input_hash)
+        adjusted_share = ec_pubkey_serialize(adjusted_handle, EC_COMPRESSED)
+
         sorted_scan_recipients = sorted(
             scan_recipients,
             key=lambda r: r["spend_key"].sec(),
         )
 
         derived_for_scan = derive_silent_payment_outputs(
-            derivation_share,
+            adjusted_share,
             [
                 (r["scan_key"], r["spend_key"], r["label"])
                 for r in sorted_scan_recipients
             ],
-            shared_secret=derivation_share[1:33],
         )
 
         for pos, recipient_row in enumerate(sorted_scan_recipients):
@@ -299,7 +319,7 @@ def populate_silent_payment_send_data_from_keys(
             )
             output_scope.sp_label = recipient_row["label"]
             if set_output_scripts:
-                output_scope.script_pubkey = p2tr(ec.PublicKey.from_xonly(xonly_key))
+                output_scope.script_pubkey = Script(b"\x51\x20" + xonly_key)
 
             derived_output_keys[output_index] = xonly_key
 

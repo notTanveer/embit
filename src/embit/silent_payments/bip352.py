@@ -21,7 +21,7 @@ from ..util.secp256k1 import (
     ec_seckey_verify,
     ec_privkey_negate,
 )
-from ..script import p2tr
+from ..script import Script
 from binascii import hexlify, unhexlify
 
 
@@ -211,6 +211,5 @@ def generate_sp_destination_address(
 
     dest_addr = []
     for output in outputs:
-        pubkey = ec.PublicKey.parse(b"\x02" + unhexlify(output))
-        dest_addr.append(p2tr(pubkey).address())
+        dest_addr.append(Script(b"\x51\x20" + unhexlify(output)).address())
     return dest_addr

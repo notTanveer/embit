@@ -15,7 +15,7 @@ from . import dleq
 from .fields import SPValidationError
 from .ecdh import get_eligible_inputs
 from ..transaction import SIGHASH
-from ..script import p2tr
+from ..script import Script
 
 
 class BIP375Validator:
@@ -352,9 +352,42 @@ class BIP375Validator:
         - Verify sorting of outputs by scan/spend keys
         """
         from ..hashes import tagged_hash
+        from ..transaction import COutPoint
+        from .bip352 import get_input_hash
+        from ..util.secp256k1 import (
+            ec_pubkey_combine,
+            ec_pubkey_parse,
+            ec_pubkey_serialize,
+            ec_pubkey_tweak_add,
+            ec_pubkey_tweak_mul,
+            EC_COMPRESSED,
+        )
 
         # Get eligible inputs
         eligible_inputs = get_eligible_inputs(self.psbt.inputs, has_sp_outputs=True)
+
+        # Build outpoints and A_sum for input_hash (same for all scan-key groups).
+        outpoints = [
+            COutPoint(txid=self.psbt.tx.vin[i].txid, out_idx=self.psbt.tx.vin[i].vout)
+            for i in eligible_inputs
+        ]
+        eligible_pubkeys = [
+            self._get_input_public_key(self.psbt.inputs[i], i)
+            for i in eligible_inputs
+        ]
+        eligible_pubkeys = [pk for pk in eligible_pubkeys if pk is not None]
+        if not eligible_pubkeys:
+            raise SPValidationError(
+                "Cannot validate output scripts: no eligible input public keys found"
+            )
+        if len(eligible_pubkeys) == 1:
+            A_sum_handle = ec_pubkey_parse(eligible_pubkeys[0].sec())
+        else:
+            A_sum_handle = ec_pubkey_parse(eligible_pubkeys[0].sec())
+            for pk in eligible_pubkeys[1:]:
+                A_sum_handle = ec_pubkey_combine(A_sum_handle, ec_pubkey_parse(pk.sec()))
+        A_sum_bytes = ec_pubkey_serialize(A_sum_handle, EC_COMPRESSED)
+        input_hash = get_input_hash(outpoints, A_sum_bytes)
 
         # Group SP outputs by scan key
         sp_outputs_by_scan = {}
@@ -372,18 +405,10 @@ class BIP375Validator:
             # Get ECDH share for this scan key
             ecdh_share = None
             if scan_key_bytes in self.psbt.sp_ecdh_shares:
-                # Global share
                 ecdh_share = self.psbt.sp_ecdh_shares[scan_key_bytes]
             else:
                 # Sum per-input shares
                 share_sum = None
-                from ..util.secp256k1 import (
-                    ec_pubkey_combine,
-                    ec_pubkey_parse,
-                    ec_pubkey_serialize,
-                    EC_COMPRESSED,
-                )
-
                 for inp_idx in eligible_inputs:
                     inp = self.psbt.inputs[inp_idx]
                     if scan_key_bytes in inp.sp_ecdh_shares:
@@ -392,12 +417,16 @@ class BIP375Validator:
                             share_sum = share
                         else:
                             share_sum = ec_pubkey_combine(share_sum, share)
-
                 if share_sum is not None:
                     ecdh_share = ec_pubkey_serialize(share_sum, EC_COMPRESSED)
 
             if not ecdh_share:
                 raise SPValidationError(f"No ECDH share found for scan key in outputs")
+
+            # Apply input_hash: adjusted_share = input_hash · ecdh_share (BIP-352)
+            adjusted_handle = ec_pubkey_parse(ecdh_share)
+            ec_pubkey_tweak_mul(adjusted_handle, input_hash)
+            adjusted_share = ec_pubkey_serialize(adjusted_handle, EC_COMPRESSED)
 
             # Sort outputs for this scan key by spend key (lexicographic)
             sorted_outputs = sorted(
@@ -411,23 +440,13 @@ class BIP375Validator:
                     # Incomplete PSBT
                     continue
 
-                # Derive expected output pubkey
                 label = out.sp_label
                 spend_key = out.sp_data.spend_key
 
-                # Compute t_k for this position
-                shared_secret = ecdh_share[1:33]
+                # Compute t_k using full 33-byte adjusted share (BIP-352)
                 t_k = tagged_hash(
                     "BIP0352/SharedSecret",
-                    shared_secret + pos.to_bytes(4, "big"),
-                )
-
-                # P = spend_key + t_k
-                from ..util.secp256k1 import (
-                    ec_pubkey_parse,
-                    ec_pubkey_tweak_add,
-                    ec_pubkey_serialize,
-                    EC_COMPRESSED,
+                    adjusted_share + pos.to_bytes(4, "big"),
                 )
 
                 # Handle label
@@ -446,8 +465,7 @@ class BIP375Validator:
                 ec_pubkey_tweak_add(p_internal, t_k)
                 p_pubkey = ec_pubkey_serialize(p_internal, EC_COMPRESSED)
 
-                # Expected output is p2tr of xonly pubkey
-                expected_script = p2tr(ec.PublicKey.from_xonly(p_pubkey[1:]))
+                expected_script = Script(b"\x51\x20" + p_pubkey[1:])
 
                 # Compare with actual script
                 if out.script_pubkey.serialize() != expected_script.serialize():

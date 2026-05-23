@@ -9,7 +9,7 @@ from embit.silent_payments import (
     populate_silent_payment_send_data_from_keys as populate_silent_payment_send_data,
 )
 from embit.script import Script, p2tr, p2wpkh
-from embit.transaction import Transaction, TransactionInput, TransactionOutput
+from embit.transaction import Transaction, TransactionInput, TransactionOutput, COutPoint
 from embit.util.key import SECP256K1_ORDER
 
 
@@ -87,7 +87,7 @@ class BIP375SendFlowTest(TestCase):
             out = psbt.outputs[output_index]
             self.assertIsNotNone(out.sp_data)
 
-            expected_script = p2tr(ec.PublicKey.from_xonly(derived[output_index]))
+            expected_script = Script(b"\x51\x20" + derived[output_index])
             self.assertEqual(out.script_pubkey.data, expected_script.data)
 
     def test_populate_send_data_is_deterministic_for_outputs(self):
@@ -214,4 +214,99 @@ class BIP375SendFlowTest(TestCase):
                 psbt_v0,
                 [(0, recipients[0][1], None)],
                 {0: b"\x44" * 32},
+            )
+
+    def test_output_key_matches_bip352_reference(self):
+        """populate_silent_payment_send_data_from_keys must produce the same output
+        key as bip352.create_outputs() for the same inputs, outpoints, and recipient.
+
+        This is the canonical cross-validation that catches both Bug 1 (missing
+        input_hash) and Bug 2 (32-byte x-only vs 33-byte compressed shared secret).
+        """
+        psbt, input_private_keys = self._make_psbtv2_with_eligible_inputs()
+        recipients = self._make_recipients()
+
+        # Only use the first recipient (single scan-key group) for simplicity.
+        single_recipient = [recipients[0]]  # (output_index=1, addr2, None)
+        addr = single_recipient[0][1]
+
+        derived = populate_silent_payment_send_data(
+            psbt,
+            single_recipient,
+            input_private_keys,
+            include_global_fields=True,
+            include_input_fields=False,
+            set_output_scripts=True,
+        )
+        psbt_xonly = derived[single_recipient[0][0]]
+
+        # Independently derive expected output using the BIP-352 reference.
+        outpoints = [
+            COutPoint(txid=psbt.tx.vin[i].txid, out_idx=psbt.tx.vin[i].vout)
+            for i in range(len(psbt.inputs))
+        ]
+        ref_outputs = bip352.create_outputs(
+            [(input_private_keys[0], False), (input_private_keys[1], False)],
+            outpoints,
+            [addr],
+        )
+        ref_xonly = bytes.fromhex(ref_outputs[addr][0])
+
+        self.assertEqual(
+            psbt_xonly,
+            ref_xonly,
+            "Output key mismatch: PSBT=%s BIP-352=%s" % (psbt_xonly.hex(), ref_xonly.hex()),
+        )
+
+    def test_output_key_matches_bip352_reference_two_recipients(self):
+        """Same cross-validation with two distinct scan-key groups (two recipients).
+
+        Exercises input_hash being applied independently per scan-key group
+        while the A_sum/outpoints are shared.  Uses unlabeled addresses so
+        bip352.create_outputs() (which ignores labels) gives the right reference.
+        """
+        psbt, input_private_keys = self._make_psbtv2_with_eligible_inputs()
+
+        scan_priv_a = ec.PrivateKey(b"\x33" * 32)
+        spend_priv_a = ec.PrivateKey(b"\x44" * 32)
+        scan_priv_b = ec.PrivateKey(b"\x55" * 32)
+        spend_priv_b = ec.PrivateKey(b"\x66" * 32)
+
+        addr_a = bip352.generate_silent_payment_address(
+            scan_priv_a, spend_priv_a.get_public_key()
+        )
+        addr_b = bip352.generate_silent_payment_address(
+            scan_priv_b, spend_priv_b.get_public_key()
+        )
+        # Two unlabeled recipients at distinct output indices.
+        recipients = [(0, addr_a, None), (1, addr_b, None)]
+
+        derived = populate_silent_payment_send_data(
+            psbt,
+            recipients,
+            input_private_keys,
+            include_global_fields=True,
+            include_input_fields=False,
+            set_output_scripts=True,
+        )
+
+        outpoints = [
+            COutPoint(txid=psbt.tx.vin[i].txid, out_idx=psbt.tx.vin[i].vout)
+            for i in range(len(psbt.inputs))
+        ]
+        input_privkey_list = [(input_private_keys[i], False) for i in range(len(psbt.inputs))]
+
+        for output_index, addr, _label in recipients:
+            ref_outputs = bip352.create_outputs(
+                input_privkey_list,
+                outpoints,
+                [addr],
+            )
+            ref_xonly = bytes.fromhex(ref_outputs[addr][0])
+            psbt_xonly = derived[output_index]
+            self.assertEqual(
+                psbt_xonly,
+                ref_xonly,
+                "Output key mismatch for addr %s: PSBT=%s BIP-352=%s"
+                % (addr[:20], psbt_xonly.hex(), ref_xonly.hex()),
             )
