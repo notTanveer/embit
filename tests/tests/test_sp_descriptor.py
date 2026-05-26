@@ -2,7 +2,8 @@ from unittest import TestCase
 from embit.descriptor import SilentPaymentDescriptor
 from embit.descriptor.sp import SPScanKey, SPSpendKey
 from embit.descriptor.arguments import KeyOrigin
-from embit import bip32, bip39
+from embit.descriptor.errors import DescriptorError
+from embit import bip32, bip39, ec
 
 # TODO: add more test vectors
 VECTORS = [
@@ -206,3 +207,70 @@ class TestChecksumHandling(TestCase):
         desc = SilentPaymentDescriptor.from_string(desc_str)
         self.assertTrue(desc.is_watch_only)
         self.assertTrue(desc.is_single_arg)
+
+
+class TestInvalidDescriptor(TestCase):
+    """Invalid sp() descriptors raise DescriptorError."""
+
+    def _scan_priv(self):
+        return ec.PrivateKey(bytes([0x01] * 32))
+
+    def _spend_pub(self):
+        return ec.PrivateKey(bytes([0x02] * 32)).get_public_key()
+
+    def test_empty_sp(self):
+        self.assertRaises(Exception, SilentPaymentDescriptor.from_string, "sp()")
+
+    def test_bare_xpub_single_arg(self):
+        """Single-arg sp() with a plain xpub (not spscan/spspend) is rejected."""
+        seed = bytes(range(16))
+        master = bip32.HDKey.from_seed(seed)
+        xpub = master.to_public().to_base58()
+        self.assertRaises(
+            DescriptorError, SilentPaymentDescriptor.from_string, "sp(%s)" % xpub
+        )
+
+    def test_xpub_xpub_scan_key_rejected(self):
+        """Two-arg sp(xpub, xpub) is rejected — scan key must be private (Sparrow testSpRejectPublicScanKey)."""
+        seed = bip39.mnemonic_to_seed(VECTORS[0]["mnemonic"])
+        master = bip32.HDKey.from_seed(seed)
+        scan_xpub = master.derive("m/352h/1h/0h/1h/0").to_public().to_base58()
+        spend_xpub = master.derive("m/352h/1h/0h/0h/0").to_public().to_base58()
+        self.assertRaises(
+            DescriptorError,
+            SilentPaymentDescriptor.from_string,
+            "sp(%s,%s)" % (scan_xpub, spend_xpub),
+        )
+
+    def test_hex_pubkey_scan_key_rejected(self):
+        """Two-arg sp(pubkey_hex, pubkey_hex) is rejected — scan key must be private."""
+        scan_pub = self._scan_priv().get_public_key()
+        spend_pub = self._spend_pub()
+        desc_str = "sp(%s,%s)" % (scan_pub.sec().hex(), spend_pub.sec().hex())
+        self.assertRaises(DescriptorError, SilentPaymentDescriptor.from_string, desc_str)
+
+    def test_spscan_in_second_position_rejected(self):
+        """Two-arg sp(wif, spscan1...) is rejected — second arg cannot be an spscan key."""
+        scan_priv = self._scan_priv()
+        spscan = SPScanKey(scan_priv, self._spend_pub())
+        desc_str = "sp(%s,%s)" % (scan_priv.wif(), spscan.encode())
+        self.assertRaises(DescriptorError, SilentPaymentDescriptor.from_string, desc_str)
+
+    def test_two_spscan_args_rejected(self):
+        """sp(spscan1..., spscan1...) is rejected — spscan must be the only argument."""
+        spscan = SPScanKey(self._scan_priv(), self._spend_pub())
+        desc_str = "sp(%s,%s)" % (spscan.encode(), spscan.encode())
+        self.assertRaises(DescriptorError, SilentPaymentDescriptor.from_string, desc_str)
+
+    def test_uncompressed_scan_key_rejected(self):
+        """Uncompressed private key as scan arg is rejected."""
+        scan_priv = ec.PrivateKey(bytes([0x01] * 32), compressed=False)
+        spend_pub = self._spend_pub()
+        desc_str = "sp(%s,%s)" % (scan_priv.wif(), spend_pub.sec().hex())
+        self.assertRaises(DescriptorError, SilentPaymentDescriptor.from_string, desc_str)
+
+    def test_trailing_junk_rejected(self):
+        """Characters after the closing ) are rejected."""
+        spscan = SPScanKey(self._scan_priv(), self._spend_pub())
+        desc_str = "sp(%s)junk" % spscan.encode()
+        self.assertRaises(DescriptorError, SilentPaymentDescriptor.from_string, desc_str)
