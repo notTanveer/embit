@@ -4,6 +4,7 @@ from embit.descriptor.sp import SPScanKey, SPSpendKey
 from embit.descriptor.arguments import KeyOrigin
 from embit.descriptor.errors import DescriptorError
 from embit import bip32, bip39, ec
+from binascii import unhexlify
 
 # TODO: add more test vectors
 VECTORS = [
@@ -124,7 +125,7 @@ class TestKeyOrigin(TestCase):
         spscan = SPScanKey(scan_priv, spend_pub, origin=origin, network=net)
         desc = SilentPaymentDescriptor.from_string("sp(%s)" % str(spscan))
         self.assertIsNotNone(desc.sp_key.origin)
-        self.assertEqual(desc.sp_key.origin.fingerprint, bytes.fromhex("deadbeef"))
+        self.assertEqual(desc.sp_key.origin.fingerprint, unhexlify("deadbeef"))
 
     def test_origin_does_not_affect_key_content(self):
         """Origin prefix doesn't change the encoded key bytes."""

@@ -29,9 +29,9 @@ class TestBIP374GenerateProofVectors(TestCase):
                 with self.subTest(index=idx, comment=comment):
                     G_bytes = unhexlify(G_hex)
 
-                    a_bytes = bytes.fromhex(a_hex)
-                    r_bytes = bytes.fromhex(r_hex)
-                    m = bytes.fromhex(msg_hex) if msg_hex else None
+                    a_bytes = unhexlify(a_hex)
+                    r_bytes = unhexlify(r_hex)
+                    m = unhexlify(msg_hex) if msg_hex else None
                     B_sec = _FAKE_INFINITY if B_hex == "INFINITY" else unhexlify(B_hex)
 
                     if result == "INVALID":
@@ -43,7 +43,7 @@ class TestBIP374GenerateProofVectors(TestCase):
                         proof = generate_dleq_proof(
                             a_bytes, B_sec, r=r_bytes, m=m, G=G_bytes
                         )
-                        self.assertEqual(proof, bytes.fromhex(result))
+                        self.assertEqual(proof, unhexlify(result))
 
 
 class TestBIP374VerifyProofVectors(TestCase):
@@ -65,11 +65,11 @@ class TestBIP374VerifyProofVectors(TestCase):
                 with self.subTest(index=idx, comment=comment):
                     G_bytes = unhexlify(G_hex)
 
-                    A_sec = bytes.fromhex(A_hex)
-                    B_sec = bytes.fromhex(B_hex)
-                    C_sec = bytes.fromhex(C_hex)
-                    proof = bytes.fromhex(proof_hex)
-                    m = bytes.fromhex(msg_hex) if msg_hex else None
+                    A_sec = unhexlify(A_hex)
+                    B_sec = unhexlify(B_hex)
+                    C_sec = unhexlify(C_hex)
+                    proof = unhexlify(proof_hex)
+                    m = unhexlify(msg_hex) if msg_hex else None
 
                     result = verify_dleq_proof(
                         A_sec, B_sec, C_sec, proof, m=m, G=G_bytes

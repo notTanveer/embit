@@ -30,6 +30,7 @@ from embit.silent_payments import (
 )
 from embit.script import Script, p2wpkh, p2tr
 from embit.transaction import TransactionOutput
+from binascii import unhexlify
 
 # ── test-vector helpers ────────────────────────────────────────────────────────
 
@@ -58,8 +59,8 @@ def _root():
 
 
 def _sp_keys(scan_hex, spend_hex):
-    scan = ec.PublicKey.parse(bytes.fromhex(scan_hex))
-    spend = ec.PublicKey.parse(bytes.fromhex(spend_hex))
+    scan = ec.PublicKey.parse(unhexlify(scan_hex))
+    spend = ec.PublicKey.parse(unhexlify(spend_hex))
     return scan, spend
 
 
@@ -128,7 +129,7 @@ class TestE2EP2WPKHFromVector(unittest.TestCase):
         PRIV_HEX, sending to the SCAN/SPEND SP output.  The raw signing key is
         loaded directly; sign_with() matches it to the input by script hash.
         """
-        priv = ec.PrivateKey(bytes.fromhex(self.PRIV_HEX))
+        priv = ec.PrivateKey(unhexlify(self.PRIV_HEX))
         pub = priv.get_public_key()
 
         scan_pub, spend_pub = _sp_keys(self.SCAN_HEX, self.SPEND_HEX)
@@ -136,7 +137,7 @@ class TestE2EP2WPKHFromVector(unittest.TestCase):
         psbt = PSBT.create_v2()
 
         inp = InputScope()
-        inp.txid = bytes.fromhex(self.PREVOUT_TXID)[::-1]
+        inp.txid = unhexlify(self.PREVOUT_TXID)[::-1]
         inp.vout = 0
         inp.sequence = 0xFFFFFFFE
         inp.witness_utxo = TransactionOutput(value=100_000, script_pubkey=p2wpkh(pub))
@@ -161,7 +162,7 @@ class TestE2EP2WPKHFromVector(unittest.TestCase):
         psbt, priv = self._build_psbt()
         psbt.sign_with(priv)
 
-        scan_key_bytes = bytes.fromhex(self.SCAN_HEX)
+        scan_key_bytes = unhexlify(self.SCAN_HEX)
         share = psbt.inputs[0].sp_ecdh_shares.get(scan_key_bytes)
         self.assertIsNotNone(share, "ECDH share not populated")
         self.assertEqual(share.hex(), self.EXPECTED_SHARE_HEX)
@@ -174,15 +175,15 @@ class TestE2EP2WPKHFromVector(unittest.TestCase):
         psbt, priv = self._build_psbt()
         psbt.sign_with(priv)
 
-        scan_key_bytes = bytes.fromhex(self.SCAN_HEX)
+        scan_key_bytes = unhexlify(self.SCAN_HEX)
         share = psbt.inputs[0].sp_ecdh_shares[scan_key_bytes]
         proof = psbt.inputs[0].sp_dleq_proofs[scan_key_bytes]
 
-        pub = ec.PublicKey.parse(bytes.fromhex(self.PUB_HEX))
+        pub = ec.PublicKey.parse(unhexlify(self.PUB_HEX))
         C = ec.PublicKey.parse(share)
         self.assertTrue(
             dleq.verify_dleq_proof(
-                pub.sec(), bytes.fromhex(self.SCAN_HEX), C.sec(), proof
+                pub.sec(), unhexlify(self.SCAN_HEX), C.sec(), proof
             )
         )
 
@@ -307,12 +308,12 @@ class TestAuxRand(unittest.TestCase):
         psbt_a, _ = _make_p2wpkh_psbt(
             self.root,
             ec.PublicKey.parse(
-                bytes.fromhex(
+                unhexlify(
                     "027a487fc19fb769877b8742d6ea18118f3c4e72b1ea8c6de602a7ad4a41dbe068"
                 )
             ),
             ec.PublicKey.parse(
-                bytes.fromhex(
+                unhexlify(
                     "0361e1b1e9de5e42cb2007f7ca54b9e0d57ed13938fad56d3f19e57513a8fce039"
                 )
             ),
@@ -321,12 +322,12 @@ class TestAuxRand(unittest.TestCase):
         psbt_b, _ = _make_p2wpkh_psbt(
             self.root,
             ec.PublicKey.parse(
-                bytes.fromhex(
+                unhexlify(
                     "027a487fc19fb769877b8742d6ea18118f3c4e72b1ea8c6de602a7ad4a41dbe068"
                 )
             ),
             ec.PublicKey.parse(
-                bytes.fromhex(
+                unhexlify(
                     "0361e1b1e9de5e42cb2007f7ca54b9e0d57ed13938fad56d3f19e57513a8fce039"
                 )
             ),
