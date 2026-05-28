@@ -8,7 +8,6 @@ Sections:
 """
 
 import io
-import os
 from collections import OrderedDict
 
 from .. import ec, hashes
@@ -429,71 +428,3 @@ class SilentPaymentsPSBT(PSBT):
                     continue
 
         return counter
-
-
-# ── signing orchestrator ──────────────────────────────────────────────────────
-
-
-class SPSigner:
-    """
-    Orchestrates the BIP-375 signing sequence:
-      1. Discard any incoming SP fields (untrusted).
-      2. Populate fresh ECDH shares + DLEQ proofs with caller-supplied entropy.
-      3. Run full BIP-375 structural validation.
-      4. Sign all inputs.
-    """
-
-    def __init__(self, psbt):
-        self.psbt = psbt
-
-    def _sp_aux_rand(self):
-        """Return 32 bytes of fresh auxiliary randomness for DLEQ proof generation."""
-        return os.urandom(32)
-
-    def _populate_silent_payment_outputs(self, root, aux_rand=None):
-        """
-        Discard incoming SP fields then compute fresh ECDH shares + DLEQ proofs.
-
-        Returns number of (ECDH-share, DLEQ-proof) pairs added.
-        """
-        for inp in self.psbt.inputs:
-            inp.sp_ecdh_shares = OrderedDict()
-            inp.sp_dleq_proofs = OrderedDict()
-        self.psbt.sp_ecdh_shares = OrderedDict()
-        self.psbt.sp_dleq_proofs = OrderedDict()
-
-        if aux_rand is None:
-            aux_rand = self._sp_aux_rand()
-        return self.psbt._sign_with_sp(root, aux_rand=aux_rand)
-
-    def sign(self, root, sighash=SIGHASH.DEFAULT):
-        """
-        Sign the PSBT, handling SP outputs correctly.
-
-        For PSBTs with SP outputs:
-          - Discards untrusted SP fields from the incoming PSBT.
-          - Populates fresh ECDH shares + DLEQ proofs.
-          - Validates BIP-375 structure (raises SPValidationError on failure).
-          - Signs all inputs.
-
-        Returns number of signatures (+ SP field pairs) added.
-        Raises SPValidationError if the PSBT is not valid for SP signing.
-        """
-        has_sp = any(out.sp_data is not None for out in self.psbt.outputs)
-
-        if not has_sp:
-            return self.psbt.sign_with(root, sighash=sighash)
-
-        if self.psbt.version != 2:
-            raise SPValidationError("SP signing requires PSBTv2")
-
-        get_eligible_inputs(self.psbt.inputs, has_sp_outputs=True)
-
-        # Populate fresh SP fields (count them; sign_with's hook will then be a no-op).
-        sp_added = self._populate_silent_payment_outputs(root)
-
-        from .validator import BIP375Validator
-
-        BIP375Validator(self.psbt).validate(skip_output_scripts=True)
-
-        return sp_added + self.psbt.sign_with(root, sighash=sighash)

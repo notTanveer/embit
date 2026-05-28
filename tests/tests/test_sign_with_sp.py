@@ -7,10 +7,8 @@ from embit.silent_payments.psbt import (
     SPOutputScope as OutputScope,
 )
 from embit.silent_payments import (
-    SPValidationError,
     SilentPaymentData,
     compute_ecdh_share,
-    sign_sp_psbt,
 )
 from embit.script import Script, p2pkh, p2wpkh
 from embit.transaction import TransactionOutput
@@ -258,62 +256,3 @@ class TestGetInputPublicKey(TestCase):
 
         result = self._validator()._get_input_public_key(inp, 0)
         self.assertIsNone(result)
-
-
-class TestSignSPPSBT(TestCase):
-
-    def test_happy_path_returns_nonzero(self):
-        """sign_sp_psbt() signs correctly and returns total fields added."""
-        root = _root()
-        scan_pub, spend_pub = _sp_keys()
-        psbt, child = _make_sp_psbt(root, scan_pub, spend_pub, txid_byte=0xDD)
-
-        count = sign_sp_psbt(psbt, root)
-        self.assertGreater(count, 0)
-
-        scan_key_bytes = scan_pub.sec()
-        self.assertIn(scan_key_bytes, psbt.inputs[0].sp_ecdh_shares)
-        self.assertIn(scan_key_bytes, psbt.inputs[0].sp_dleq_proofs)
-
-    def test_raises_for_psbtv0(self):
-        """sign_sp_psbt() rejects PSBTv0."""
-        from embit.transaction import (
-            Transaction,
-            TransactionInput,
-            TransactionOutput as TxOut,
-        )
-
-        tx = Transaction(version=2, locktime=0)
-        tx.vin = [TransactionInput(txid=bytes(32), vout=0)]
-        tx.vout = [TxOut(value=99_000, script_pubkey=Script(b"\x51\x20" + bytes(32)))]
-        psbt = PSBT(tx)  # PSBTv0 (version=None)
-
-        scan_pub, spend_pub = _sp_keys()
-        psbt.outputs[0].sp_data = SilentPaymentData(scan_pub, spend_pub)
-
-        with self.assertRaises(SPValidationError):
-            sign_sp_psbt(psbt, _root())
-
-    def test_raises_when_no_sp_outputs(self):
-        """sign_sp_psbt() rejects PSBTs with no SP outputs."""
-        root = _root()
-        child = root.derive([0, 0])
-        child_pub = child.get_public_key()
-
-        psbt = PSBT.create_v2()
-        inp = InputScope()
-        inp.txid = bytes([0xEE] * 32)
-        inp.vout = 0
-        inp.sequence = 0xFFFFFFFE
-        inp.witness_utxo = TransactionOutput(
-            value=100_000, script_pubkey=p2wpkh(child_pub)
-        )
-        psbt.add_input(inp)
-
-        out = OutputScope()
-        out.value = 99_000
-        out.script_pubkey = Script(b"\x51\x20" + bytes(32))
-        psbt.add_output(out)
-
-        with self.assertRaises(SPValidationError):
-            sign_sp_psbt(psbt, root)

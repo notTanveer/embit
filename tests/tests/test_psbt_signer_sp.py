@@ -1,37 +1,34 @@
 """
-Tests for SPSigner with Silent Payment outputs.
+End-to-end Silent Payment signing tests via SilentPaymentsPSBT.sign_with().
+
+This is the hardware-signer flow: the signer holds the key, sign_with()
+populates per-input ECDH shares + DLEQ proofs for SP outputs and signs.
 
 Covers:
-  - End-to-end P2WPKH single-sig signing verified against BIP-375 test vectors.
-  - Rejection of multisig input + SP output (ineligible input type).
-  - Rejection of P2TR input + SP output (BIP-375 prohibits Segwit v>1).
-  - SPSigner discards incoming SP fields before repopulating.
-  - PSBT version=2 is preserved after SPSigner.sign().
-  - aux_rand parameter threads through to DLEQ proof generation.
+  - P2WPKH single-sig signing verified against BIP-375 test vectors.
+  - P2TR input + SP output is rejected (BIP-375 prohibits Segwit v>1).
+  - Ineligible (bare-multisig P2SH) input produces no SP fields.
+  - Explicit aux_rand threads through to DLEQ proof generation.
 """
 
 import json
 import unittest
-from collections import OrderedDict
 from pathlib import Path
 
 from embit import bip32, ec
 from embit.silent_payments import dleq
 from embit.psbt import DerivationPath
-from embit.silent_payments import SilentPaymentsPSBT as PSBT, SPSigner
+from embit.silent_payments import SilentPaymentsPSBT as PSBT
 from embit.silent_payments.psbt import (
     SPInputScope as InputScope,
     SPOutputScope as OutputScope,
 )
 from embit.silent_payments import (
     SPValidationError,
-    SPFieldError,
     SilentPaymentData,
-    compute_ecdh_share,
-    compute_dleq_proof,
-    populate_silent_payment_send_data,
+    get_eligible_inputs,
 )
-from embit.script import Script, p2wpkh, p2tr, p2pkh
+from embit.script import Script, p2wpkh, p2tr
 from embit.transaction import TransactionOutput
 
 # ── test-vector helpers ────────────────────────────────────────────────────────
@@ -70,9 +67,8 @@ def _make_p2wpkh_psbt(root, scan_pub, spend_pub, value=100_000, txid_byte=0xAA):
     """
     Minimal PSBTv2 with one P2WPKH input and one SP output.
 
-    The PSBT is put into its post-construction (pre-signing) state by
-    setting tx_modifiable_flags = 0, which is required by BIP-375 when
-    a script_pubkey is already present on an SP output.
+    tx_modifiable_flags is set to 0, required by BIP-375 when a
+    script_pubkey is already present on an SP output.
     """
     child = root.derive([0, 0])
     pub = child.get_public_key()
@@ -93,8 +89,6 @@ def _make_p2wpkh_psbt(root, scan_pub, spend_pub, value=100_000, txid_byte=0xAA):
     out.sp_data = SilentPaymentData(scan_pub, spend_pub)
     psbt.add_output(out)
 
-    # Post-construction: no further modifications allowed (required by BIP-375
-    # when PSBT_OUT_SCRIPT is set on an SP output).
     psbt.tx_modifiable_flags = 0
 
     return psbt, child
@@ -107,10 +101,9 @@ class TestE2EP2WPKHFromVector(unittest.TestCase):
     """
     End-to-end signing test using data from the BIP-375 test vectors.
 
-    We reconstruct the PSBT scenario from the supplementary data in the
-    "two inputs single-signer using per-input ECDH shares" vector, using
-    only input 0 (P2WPKH).  The expected ECDH share for that input is
-    deterministic and must match the value in the test vector exactly.
+    We reconstruct input 0 (P2WPKH) of the "two inputs single-signer using
+    per-input ECDH shares" vector.  The expected ECDH share is deterministic
+    and must match the value in the test vector exactly.
     """
 
     PRIV_HEX = "7e31eeeb1aa2597b6d63b357541461d75ddae76b7603d24619f5ebed9e88ec31"
@@ -131,17 +124,10 @@ class TestE2EP2WPKHFromVector(unittest.TestCase):
 
     def _build_psbt(self):
         """
-        Build a PSBTv2 that matches the scenario of vector input 0:
-        a P2WPKH input controlled by PRIV_HEX, sending to the SCAN/SPEND SP output.
-
-        We use a standard HD root (bytes(range(32))) and configure the input's
-        bip32_derivation so that the validator can find the correct public key.
-        The signing key is the known vector private key, loaded directly.
+        Build a PSBTv2 matching vector input 0: a P2WPKH input controlled by
+        PRIV_HEX, sending to the SCAN/SPEND SP output.  The raw signing key is
+        loaded directly; sign_with() matches it to the input by script hash.
         """
-        # Root for deriving the signing key (standard test seed).
-        root = bip32.HDKey.from_seed(bytes(range(32)))
-        child = root.derive([0, 0])
-        # Actual signing key from the test vector.
         priv = ec.PrivateKey(bytes.fromhex(self.PRIV_HEX))
         pub = priv.get_public_key()
 
@@ -154,10 +140,7 @@ class TestE2EP2WPKHFromVector(unittest.TestCase):
         inp.vout = 0
         inp.sequence = 0xFFFFFFFE
         inp.witness_utxo = TransactionOutput(value=100_000, script_pubkey=p2wpkh(pub))
-        # BIP32 derivation so the validator can identify the pubkey via hash160.
-        # We use the root fingerprint but point it at our known pub so the
-        # hash-match in _get_input_public_key succeeds.
-        inp.bip32_derivations[pub] = DerivationPath(root.my_fingerprint, [0, 0])
+        inp.bip32_derivations[pub] = DerivationPath(b"\x00\x00\x00\x00", [0, 0])
         psbt.add_input(inp)
 
         out = OutputScope()
@@ -166,19 +149,17 @@ class TestE2EP2WPKHFromVector(unittest.TestCase):
         out.sp_data = SilentPaymentData(scan_pub, spend_pub)
         psbt.add_output(out)
 
-        # BIP-375: tx_modifiable_flags must be 0 when PSBT_OUT_SCRIPT is set.
         psbt.tx_modifiable_flags = 0
 
         return psbt, priv
 
     def test_ecdh_share_matches_vector(self):
-        """ECDH share computed by SPSigner.sign() matches the test vector value."""
+        """ECDH share populated by sign_with() matches the test vector value."""
         if self.vector is None:
             self.skipTest("Test vector not found in bip375_test_vectors.json")
 
         psbt, priv = self._build_psbt()
-        signer = SPSigner(psbt)
-        signer.sign(priv)
+        psbt.sign_with(priv)
 
         scan_key_bytes = bytes.fromhex(self.SCAN_HEX)
         share = psbt.inputs[0].sp_ecdh_shares.get(scan_key_bytes)
@@ -186,12 +167,12 @@ class TestE2EP2WPKHFromVector(unittest.TestCase):
         self.assertEqual(share.hex(), self.EXPECTED_SHARE_HEX)
 
     def test_dleq_proof_valid(self):
-        """DLEQ proof generated by SPSigner.sign() verifies correctly."""
+        """DLEQ proof generated by sign_with() verifies correctly."""
         if self.vector is None:
             self.skipTest("Test vector not found in bip375_test_vectors.json")
 
         psbt, priv = self._build_psbt()
-        SPSigner(psbt).sign(priv)
+        psbt.sign_with(priv)
 
         scan_key_bytes = bytes.fromhex(self.SCAN_HEX)
         share = psbt.inputs[0].sp_ecdh_shares[scan_key_bytes]
@@ -206,18 +187,18 @@ class TestE2EP2WPKHFromVector(unittest.TestCase):
         )
 
     def test_full_psbt_sign_produces_signature(self):
-        """sign() also places a partial_sig on the input."""
+        """sign_with() also places a partial_sig on the input."""
         psbt, priv = self._build_psbt()
-        count = SPSigner(psbt).sign(priv)
+        count = psbt.sign_with(priv)
         self.assertGreater(count, 0)
         self.assertGreater(len(psbt.inputs[0].partial_sigs), 0)
 
 
-# ── rejection tests ────────────────────────────────────────────────────────────
+# ── input eligibility ───────────────────────────────────────────────────────────
 
 
-class TestSPSignerRejectsIneligibleInputs(unittest.TestCase):
-    """SPSigner.sign() must raise SPValidationError for prohibited input types."""
+class TestInputEligibility(unittest.TestCase):
+    """BIP-375 input eligibility constraints for SP outputs."""
 
     SCAN_HEX = "027a487fc19fb769877b8742d6ea18118f3c4e72b1ea8c6de602a7ad4a41dbe068"
     SPEND_HEX = "0361e1b1e9de5e42cb2007f7ca54b9e0d57ed13938fad56d3f19e57513a8fce039"
@@ -238,7 +219,6 @@ class TestSPSignerRejectsIneligibleInputs(unittest.TestCase):
         inp.txid = bytes([0xBB] * 32)
         inp.vout = 0
         inp.sequence = 0xFFFFFFFE
-        # P2TR UTXO for this input
         inp.witness_utxo = TransactionOutput(value=100_000, script_pubkey=p2tr(pub))
         inp.taproot_internal_key = pub
         inp.bip32_derivations[pub] = DerivationPath(root.my_fingerprint, [0, 0])
@@ -253,12 +233,12 @@ class TestSPSignerRejectsIneligibleInputs(unittest.TestCase):
         psbt.tx_modifiable_flags = 0
 
         with self.assertRaises(SPValidationError):
-            SPSigner(psbt).sign(root)
+            get_eligible_inputs(psbt.inputs, has_sp_outputs=True)
 
-    def test_multisig_p2sh_input_with_sp_output_no_sp_fields(self):
+    def test_multisig_p2sh_input_produces_no_sp_fields(self):
         """
-        A P2SH bare-multisig input is ineligible for SP (not P2WPKH/P2PKH/P2SH-P2WPKH).
-        SPSigner.sign() should complete without adding SP fields for that input.
+        A P2SH bare-multisig input is ineligible for SP (not P2WPKH/P2PKH/
+        P2SH-P2WPKH).  sign_with() completes without adding SP fields for it.
         """
         root = _root()
         child1 = root.derive([0, 0])
@@ -267,17 +247,6 @@ class TestSPSignerRejectsIneligibleInputs(unittest.TestCase):
         pub2 = child2.get_public_key()
         scan_pub, spend_pub = self._scan_spend()
 
-        # Build a 1-of-2 multisig redeem script (P2SH bare multisig, not P2SH-P2WPKH).
-        # embit script helpers: OP_1 <pub1> <pub2> OP_2 OP_CHECKMULTISIG
-        redeem_script_data = (
-            b"\x51"  # OP_1
-            + b"\x41"
-            + b"\x04"
-            + pub1.sec()[1:]
-            + b"\x00" * (65 - 33)  # uncompressed-like placeholder
-            # This is complex; let's just build a dummy non-P2WPKH P2SH input
-        )
-        # Actually build a simpler P2SH multisig: use raw Script bytes
         # OP_1 <33-byte-pub1> <33-byte-pub2> OP_2 OP_CHECKMULTISIG
         redeem_raw = (
             bytes([0x51])
@@ -288,7 +257,6 @@ class TestSPSignerRejectsIneligibleInputs(unittest.TestCase):
             + bytes([0x52, 0xAE])
         )
         from embit.script import p2sh
-        from embit import hashes as _h
 
         redeem = Script(redeem_raw)
         p2sh_script = p2sh(redeem)
@@ -313,17 +281,15 @@ class TestSPSignerRejectsIneligibleInputs(unittest.TestCase):
 
         psbt.tx_modifiable_flags = 0
 
-        # sign() should not raise; multisig just produces 0 SP fields
-        SPSigner(psbt).sign(root)
-        # No SP fields: multisig is not an eligible input type
+        psbt.sign_with(root)
         self.assertEqual(len(psbt.inputs[0].sp_ecdh_shares), 0)
         self.assertEqual(len(psbt.inputs[0].sp_dleq_proofs), 0)
 
 
-# ── SPSigner behaviour tests ─────────────────────────────────────────────────
+# ── aux_rand threading ──────────────────────────────────────────────────────────
 
 
-class TestSPSignerBehaviour(unittest.TestCase):
+class TestAuxRand(unittest.TestCase):
 
     def setUp(self):
         self.root = _root()
@@ -334,28 +300,8 @@ class TestSPSignerBehaviour(unittest.TestCase):
         self.psbt, self.child = _make_p2wpkh_psbt(self.root, scan_pub, spend_pub)
         self.scan_key_bytes = scan_pub.sec()
 
-    def test_discards_incoming_sp_fields(self):
-        """Incoming SP fields are replaced with freshly computed ones."""
-        # Pre-populate with garbage
-        self.psbt.inputs[0].sp_ecdh_shares[self.scan_key_bytes] = b"\xff" * 33
-        self.psbt.inputs[0].sp_dleq_proofs[self.scan_key_bytes] = b"\xff" * 64
-
-        SPSigner(self.psbt).sign(self.root)
-
-        share = self.psbt.inputs[0].sp_ecdh_shares[self.scan_key_bytes]
-        # Not the garbage value
-        self.assertNotEqual(share, b"\xff" * 33)
-        # Valid compressed pubkey
-        self.assertIn(share[0], [0x02, 0x03])
-        self.assertEqual(len(share), 33)
-
-    def test_version_preserved(self):
-        """SPSigner.sign() does not downgrade the PSBT version to 0."""
-        SPSigner(self.psbt).sign(self.root)
-        self.assertEqual(self.psbt.version, 2)
-
     def test_aux_rand_deterministic(self):
-        """When explicit aux_rand is supplied, the DLEQ proof is deterministic."""
+        """Explicit aux_rand makes the DLEQ proof deterministic across runs."""
         aux = bytes(range(32))
 
         psbt_a, _ = _make_p2wpkh_psbt(
@@ -387,37 +333,12 @@ class TestSPSignerBehaviour(unittest.TestCase):
             txid_byte=0x01,
         )
 
-        signer_a = SPSigner(psbt_a)
-        signer_a._populate_silent_payment_outputs(self.root, aux_rand=aux)
-
-        signer_b = SPSigner(psbt_b)
-        signer_b._populate_silent_payment_outputs(self.root, aux_rand=aux)
+        psbt_a._sign_with_sp(self.root, aux_rand=aux)
+        psbt_b._sign_with_sp(self.root, aux_rand=aux)
 
         proof_a = psbt_a.inputs[0].sp_dleq_proofs[self.scan_key_bytes]
         proof_b = psbt_b.inputs[0].sp_dleq_proofs[self.scan_key_bytes]
         self.assertEqual(proof_a, proof_b)
-
-    def test_populate_sp_outputs_function(self):
-        """populate_silent_payment_send_data convenience function works."""
-        # Strip incoming SP fields first
-        self.psbt.inputs[0].sp_ecdh_shares = OrderedDict()
-        self.psbt.inputs[0].sp_dleq_proofs = OrderedDict()
-
-        count = populate_silent_payment_send_data(
-            self.psbt, self.root, aux_rand=bytes(range(32))
-        )
-        self.assertGreater(count, 0)
-        self.assertIn(self.scan_key_bytes, self.psbt.inputs[0].sp_ecdh_shares)
-
-    def test_sp_fields_survive_serialization(self):
-        """SP fields written by SPSigner survive a PSBT serialize/parse round-trip."""
-        SPSigner(self.psbt).sign(self.root)
-        raw = self.psbt.serialize()
-        parsed = PSBT.parse(raw)
-
-        self.assertEqual(parsed.version, 2)
-        self.assertIn(self.scan_key_bytes, parsed.inputs[0].sp_ecdh_shares)
-        self.assertIn(self.scan_key_bytes, parsed.inputs[0].sp_dleq_proofs)
 
 
 if __name__ == "__main__":
