@@ -1,11 +1,9 @@
 from io import BytesIO
-from .. import bech32, ec, bip32
+from .. import bech32, ec
 from ..misc import read_until
 from .base import DescriptorBase
 from .errors import DescriptorError
-from .arguments import KeyOrigin, Key, AllowedDerivation
-from .checksum import add_checksum
-
+from .arguments import KeyOrigin, Key
 
 SPSCAN_HRPS = {"spscan": "main", "tspscan": "test"}
 SPSPEND_HRPS = {"spspend": "main", "tspspend": "test"}
@@ -256,7 +254,7 @@ class SilentPaymentDescriptor(DescriptorBase):
         scan_key = first_arg
         if not _is_private_key(scan_key):
             raise DescriptorError("Two-arg sp(): scan key must be private")
-        if not scan_key.key.compressed if isinstance(scan_key.key, ec.PrivateKey) else False:
+        if isinstance(scan_key.key, ec.PrivateKey) and not scan_key.key.compressed:
             raise DescriptorError("Uncompressed keys are not allowed in sp()")
 
         spend_arg, _ = _read_sp_key_expression(s)

@@ -1261,35 +1261,6 @@ class PSBT(EmbitBase):
             h = self.sighash_legacy(i, sc, sighash=sighash)
         return h
 
-    def sign_input_with_sp_tweak(
-        self,
-        key: ec.PrivateKey,
-        input_index: int,
-        inp=None,
-        sighash=SIGHASH.DEFAULT,
-    ) -> int:
-        """BIP-376: sign a Silent Payment spend input using sp_tweak field."""
-        inp = inp or self.inputs[input_index]
-        sp_tweak = getattr(inp, "sp_tweak", None)
-        if sp_tweak is None:
-            return 0
-        if not inp.is_taproot:
-            return 0
-        try:
-            pk = key.sp_spend_tweak(sp_tweak)
-        except Exception:
-            return 0
-        output_xonly = inp.utxo.script_pubkey.data[2:34]
-        if pk.xonly() != output_xonly:
-            return 0
-        h = self.sighash(input_index, sighash=sighash)
-        sig = pk.schnorr_sign(h)
-        sigdata = sig.serialize()
-        if sighash != SIGHASH.DEFAULT:
-            sigdata += bytes([sighash])
-        inp.taproot_key_sig = sigdata
-        return 1
-
     def sign_input_with_tapkey(
         self,
         key: ec.PrivateKey,

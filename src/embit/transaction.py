@@ -4,7 +4,6 @@ from . import hashes
 from .base import EmbitBase, EmbitError
 from .script import Script, Witness
 from .misc import const
-from binascii import unhexlify
 from typing import NamedTuple
 
 
@@ -423,31 +422,7 @@ class COutPoint(NamedTuple):
     txid: bytes  # endianness same as hex string displayed; reverse of tx serialization order
     out_idx: int
 
-    @classmethod
-    def from_str(cls, s: str) -> "COutPoint":
-        hash_str, idx_str = s.split(":")
-        assert len(hash_str) == 64, f"{hash_str} should be a sha256 hash"
-        return COutPoint(txid=unhexlify(hash_str), out_idx=int(idx_str))
-
-    def __str__(self) -> str:
-        return f"""COutPoint("{self.to_str()}")"""
-
-    def __repr__(self):
-        return f"<{str(self)}>"
-
-    def to_str(self) -> str:
-        return f"{self.txid.hex()}:{self.out_idx}"
-
-    def to_json(self):
-        return [self.txid.hex(), self.out_idx]
-
     def serialize(self) -> bytes:
         return self.txid[::-1] + int.to_bytes(
             self.out_idx, length=4, byteorder="little", signed=False
         )
-
-    def is_coinbase(self) -> bool:
-        return self.txid == bytes(32)
-
-    def short_name(self):
-        return f"{self.txid.hex()[0:10]}:{self.out_idx}"

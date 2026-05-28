@@ -7,9 +7,11 @@ Sections:
   3. SPSigner — high-level signing wrapper (clear → populate → validate → sign)
 """
 
+import io
+import os
 from collections import OrderedDict
 
-from .. import hashes
+from .. import ec, hashes
 from ..psbt import (
     PSBT,
     DerivationPath,
@@ -81,15 +83,12 @@ class SPInputScope(InputScope):
                     "PSBT_IN_SP_SPEND_BIP32_DERIVATION not allowed in PSBTv0"
                 )
             if len(k) != 34:
-                raise PSBTError(
-                    "Invalid PSBT_IN_SP_SPEND_BIP32_DERIVATION key length"
-                )
+                raise PSBTError("Invalid PSBT_IN_SP_SPEND_BIP32_DERIVATION key length")
             pub_bytes = k[1:]
             if pub_bytes in self.sp_spend_bip32_derivations:
                 raise PSBTError(
                     "Duplicated PSBT_IN_SP_SPEND_BIP32_DERIVATION for pubkey"
                 )
-            import io
             self.sp_spend_bip32_derivations[pub_bytes] = DerivationPath.read_from(
                 io.BytesIO(v)
             )
@@ -266,16 +265,74 @@ class SilentPaymentsPSBT(PSBT):
             counter += self._sign_sp_spends(root)
         return counter
 
-    def _sign_sp_spends(self, root) -> int:
-        """BIP-376: sign inputs that carry sp_tweak using sp_spend_bip32_derivations."""
+    @staticmethod
+    def _signing_fingerprint(root):
+        """Resolve the signing fingerprint for ``root``.
+
+        Returns ``(fingerprint, can_sign)``.  ``fingerprint`` is None for raw/WIF
+        keys (which match by key material instead).  ``can_sign`` is False when
+        ``root`` is a public-only descriptor key that cannot produce signatures.
+        """
         fingerprint = None
         if hasattr(root, "origin"):
             if not getattr(root, "is_private", True):
-                return 0
+                return None, False
             if getattr(root, "is_extended", False):
                 fingerprint = root.fingerprint
         if not fingerprint and hasattr(root, "my_fingerprint"):
             fingerprint = root.my_fingerprint
+        return fingerprint, True
+
+    @staticmethod
+    def _derive_hdkey(root, derivation):
+        """Derive the HDKey for ``derivation``, honoring the root's origin prefix.
+
+        Returns the derived HDKey, or None if the origin prefix doesn't match.
+        """
+        der = derivation.derivation
+        if hasattr(root, "origin"):
+            if root.origin:
+                prefix = root.origin.derivation
+                if der[: len(prefix)] != prefix:
+                    return None
+                der = der[len(prefix) :]
+            return root.key.derive(der)
+        return root.derive(der)
+
+    def sign_input_with_sp_tweak(
+        self,
+        key: "ec.PrivateKey",
+        input_index: int,
+        inp=None,
+        sighash=SIGHASH.DEFAULT,
+    ) -> int:
+        """BIP-376: sign a Silent Payment spend input using sp_tweak field."""
+        inp = inp or self.inputs[input_index]
+        sp_tweak = getattr(inp, "sp_tweak", None)
+        if sp_tweak is None:
+            return 0
+        if not inp.is_taproot:
+            return 0
+        try:
+            pk = key.sp_spend_tweak(sp_tweak)
+        except Exception:
+            return 0
+        output_xonly = inp.utxo.script_pubkey.data[2:34]
+        if pk.xonly() != output_xonly:
+            return 0
+        h = self.sighash(input_index, sighash=sighash)
+        sig = pk.schnorr_sign(h)
+        sigdata = sig.serialize()
+        if sighash != SIGHASH.DEFAULT:
+            sigdata += bytes([sighash])
+        inp.taproot_key_sig = sigdata
+        return 1
+
+    def _sign_sp_spends(self, root) -> int:
+        """BIP-376: sign inputs that carry sp_tweak using sp_spend_bip32_derivations."""
+        fingerprint, can_sign = self._signing_fingerprint(root)
+        if not can_sign:
+            return 0
 
         counter = 0
         for i, inp in enumerate(self.inputs):
@@ -290,17 +347,8 @@ class SilentPaymentsPSBT(PSBT):
                 for pub_bytes, derivation in inp.sp_spend_bip32_derivations.items():
                     if derivation.fingerprint != fingerprint:
                         continue
-                    der = derivation.derivation
-                    if hasattr(root, "origin"):
-                        if root.origin:
-                            prefix = root.origin.derivation
-                            if der[: len(prefix)] != prefix:
-                                continue
-                            der = der[len(prefix) :]
-                        hdkey = root.key.derive(der)
-                    else:
-                        hdkey = root.derive(der)
-                    if hdkey.xonly() != pub_bytes[1:]:
+                    hdkey = self._derive_hdkey(root, derivation)
+                    if hdkey is None or hdkey.xonly() != pub_bytes[1:]:
                         continue
                     priv_key = hdkey.key
                     break
@@ -335,14 +383,9 @@ class SilentPaymentsPSBT(PSBT):
         if not eligible:
             return 0
 
-        fingerprint = None
-        if hasattr(root, "origin"):
-            if not getattr(root, "is_private", True):
-                return 0
-            if getattr(root, "is_extended", False):
-                fingerprint = root.fingerprint
-        if not fingerprint and hasattr(root, "my_fingerprint"):
-            fingerprint = root.my_fingerprint
+        fingerprint, can_sign = self._signing_fingerprint(root)
+        if not can_sign:
+            return 0
 
         counter = 0
 
@@ -354,17 +397,8 @@ class SilentPaymentsPSBT(PSBT):
                 for pub, derivation in inp.bip32_derivations.items():
                     if derivation.fingerprint != fingerprint:
                         continue
-                    der = derivation.derivation
-                    if hasattr(root, "origin"):
-                        if root.origin:
-                            prefix = root.origin.derivation
-                            if der[: len(prefix)] != prefix:
-                                continue
-                            der = der[len(prefix) :]
-                        hdkey = root.key.derive(der)
-                    else:
-                        hdkey = root.derive(der)
-                    if hdkey.xonly() != pub.xonly():
+                    hdkey = self._derive_hdkey(root, derivation)
+                    if hdkey is None or hdkey.xonly() != pub.xonly():
                         continue
                     priv_bytes = hdkey.key.secret
                     break
@@ -414,9 +448,7 @@ class SPSigner:
 
     def _sp_aux_rand(self):
         """Return 32 bytes of fresh auxiliary randomness for DLEQ proof generation."""
-        import os as _os
-
-        return _os.urandom(32)
+        return os.urandom(32)
 
     def _populate_silent_payment_outputs(self, root, aux_rand=None):
         """
@@ -449,16 +481,19 @@ class SPSigner:
         """
         has_sp = any(out.sp_data is not None for out in self.psbt.outputs)
 
-        if has_sp:
-            if self.psbt.version != 2:
-                raise SPValidationError("SP signing requires PSBTv2")
+        if not has_sp:
+            return self.psbt.sign_with(root, sighash=sighash)
 
-            get_eligible_inputs(self.psbt.inputs, has_sp_outputs=True)
+        if self.psbt.version != 2:
+            raise SPValidationError("SP signing requires PSBTv2")
 
-            self._populate_silent_payment_outputs(root)
+        get_eligible_inputs(self.psbt.inputs, has_sp_outputs=True)
 
-            from .validator import BIP375Validator
+        # Populate fresh SP fields (count them; sign_with's hook will then be a no-op).
+        sp_added = self._populate_silent_payment_outputs(root)
 
-            BIP375Validator(self.psbt).validate(skip_output_scripts=True)
+        from .validator import BIP375Validator
 
-        return self.psbt.sign_with(root, sighash=sighash)
+        BIP375Validator(self.psbt).validate(skip_output_scripts=True)
+
+        return sp_added + self.psbt.sign_with(root, sighash=sighash)

@@ -2,6 +2,7 @@
 BIP-375 ECDH share and DLEQ proof computation, plus input eligibility.
 """
 
+import os
 from typing import List, Optional, TYPE_CHECKING
 
 from .. import ec
@@ -94,9 +95,7 @@ def compute_dleq_proof(
     Returns:
         64-byte DLEQ proof
     """
-    import os as _os
-
-    r = aux_rand if aux_rand is not None else _os.urandom(32)
+    r = aux_rand if aux_rand is not None else os.urandom(32)
     try:
         return dleq.generate_dleq_proof(private_key, scan_key.sec(), r=r)
     except dleq.DLEQError as e:
@@ -122,15 +121,13 @@ def compute_global_dleq_proof(
     Returns:
         64-byte DLEQ proof
     """
-    import os as _os
-
     # Sum all private keys mod n
     a_sum = sum(int.from_bytes(priv, "big") for priv in private_keys) % SECP256K1_ORDER
     if a_sum == 0:
         raise SPFieldError("Cannot generate proof for zero sum")
 
     a_sum_bytes = a_sum.to_bytes(32, "big")
-    r = aux_rand if aux_rand is not None else _os.urandom(32)
+    r = aux_rand if aux_rand is not None else os.urandom(32)
 
     try:
         return dleq.generate_dleq_proof(a_sum_bytes, scan_key.sec(), r=r)

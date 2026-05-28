@@ -14,8 +14,26 @@ from .. import ec
 from . import dleq
 from .fields import SPValidationError
 from .ecdh import get_eligible_inputs
-from ..transaction import SIGHASH
+from .outputs import derive_silent_payment_outputs
+from ..transaction import SIGHASH, COutPoint
 from ..script import Script
+from ..hashes import hash160
+from .bip352 import get_input_hash
+from ..util.secp256k1 import (
+    ec_pubkey_combine,
+    ec_pubkey_parse,
+    ec_pubkey_serialize,
+    ec_pubkey_tweak_mul,
+    EC_COMPRESSED,
+)
+
+
+def _sum_pubkeys(pubkeys: List[ec.PublicKey]) -> bytes:
+    """Sum a non-empty list of public keys, returning a 33-byte compressed point."""
+    acc = ec_pubkey_parse(pubkeys[0].sec())
+    for pk in pubkeys[1:]:
+        acc = ec_pubkey_combine(acc, ec_pubkey_parse(pk.sec()))
+    return ec_pubkey_serialize(acc, EC_COMPRESSED)
 
 
 class BIP375Validator:
@@ -218,19 +236,7 @@ class BIP375Validator:
                 f"with public keys"
             )
 
-        # Sum the public keys
-        if len(eligible_pubkeys) == 1:
-            A_sum = eligible_pubkeys[0]
-        else:
-            from ..util.secp256k1 import ec_pubkey_combine, ec_pubkey_parse
-
-            pubkey_handles = [ec_pubkey_parse(pk.sec()) for pk in eligible_pubkeys]
-            result = pubkey_handles[0]
-            for pk_handle in pubkey_handles[1:]:
-                result = ec_pubkey_combine(result, pk_handle)
-            from ..util.secp256k1 import ec_pubkey_serialize, EC_COMPRESSED
-
-            A_sum = ec.PublicKey.parse(ec_pubkey_serialize(result, EC_COMPRESSED))
+        A_sum_bytes = _sum_pubkeys(eligible_pubkeys)
 
         # Get ECDH share as public key
         ecdh_share = self.psbt.sp_ecdh_shares[scan_key_bytes]
@@ -238,7 +244,7 @@ class BIP375Validator:
 
         # Verify proof
         if not dleq.verify_dleq_proof(
-            A_sum.sec(), scan_key.sec(), C.sec(), proof_bytes
+            A_sum_bytes, scan_key.sec(), C.sec(), proof_bytes
         ):
             raise SPValidationError(
                 f"Output {out_idx}: Global DLEQ proof verification failed"
@@ -279,8 +285,6 @@ class BIP375Validator:
         Falls back to partial_sigs keys when bip32_derivations is absent (e.g. a
         trimmed PSBT where the signer stripped BIP-32 metadata to save space).
         """
-        from ..hashes import hash160
-
         script = inp.script_pubkey
         if script is None:
             return None
@@ -351,18 +355,6 @@ class BIP375Validator:
         - Verify script is correctly derived from SP data and ECDH shares
         - Verify sorting of outputs by scan/spend keys
         """
-        from ..hashes import tagged_hash
-        from ..transaction import COutPoint
-        from .bip352 import get_input_hash
-        from ..util.secp256k1 import (
-            ec_pubkey_combine,
-            ec_pubkey_parse,
-            ec_pubkey_serialize,
-            ec_pubkey_tweak_add,
-            ec_pubkey_tweak_mul,
-            EC_COMPRESSED,
-        )
-
         # Get eligible inputs
         eligible_inputs = get_eligible_inputs(self.psbt.inputs, has_sp_outputs=True)
 
@@ -372,21 +364,14 @@ class BIP375Validator:
             for i in eligible_inputs
         ]
         eligible_pubkeys = [
-            self._get_input_public_key(self.psbt.inputs[i], i)
-            for i in eligible_inputs
+            self._get_input_public_key(self.psbt.inputs[i], i) for i in eligible_inputs
         ]
         eligible_pubkeys = [pk for pk in eligible_pubkeys if pk is not None]
         if not eligible_pubkeys:
             raise SPValidationError(
                 "Cannot validate output scripts: no eligible input public keys found"
             )
-        if len(eligible_pubkeys) == 1:
-            A_sum_handle = ec_pubkey_parse(eligible_pubkeys[0].sec())
-        else:
-            A_sum_handle = ec_pubkey_parse(eligible_pubkeys[0].sec())
-            for pk in eligible_pubkeys[1:]:
-                A_sum_handle = ec_pubkey_combine(A_sum_handle, ec_pubkey_parse(pk.sec()))
-        A_sum_bytes = ec_pubkey_serialize(A_sum_handle, EC_COMPRESSED)
+        A_sum_bytes = _sum_pubkeys(eligible_pubkeys)
         input_hash = get_input_hash(outpoints, A_sum_bytes)
 
         # Group SP outputs by scan key
@@ -400,8 +385,6 @@ class BIP375Validator:
 
         # For each scan key, validate outputs
         for scan_key_bytes, outputs_for_scan in sp_outputs_by_scan.items():
-            scan_key = ec.PublicKey.parse(scan_key_bytes)
-
             # Get ECDH share for this scan key
             ecdh_share = None
             if scan_key_bytes in self.psbt.sp_ecdh_shares:
@@ -421,53 +404,35 @@ class BIP375Validator:
                     ecdh_share = ec_pubkey_serialize(share_sum, EC_COMPRESSED)
 
             if not ecdh_share:
-                raise SPValidationError(f"No ECDH share found for scan key in outputs")
+                raise SPValidationError("No ECDH share found for scan key in outputs")
 
             # Apply input_hash: adjusted_share = input_hash · ecdh_share (BIP-352)
             adjusted_handle = ec_pubkey_parse(ecdh_share)
             ec_pubkey_tweak_mul(adjusted_handle, input_hash)
             adjusted_share = ec_pubkey_serialize(adjusted_handle, EC_COMPRESSED)
 
-            # Sort outputs for this scan key by spend key (lexicographic)
+            # Sort outputs for this scan key by spend key (lexicographic).  The
+            # derivation counter k is the position in this sorted order.
             sorted_outputs = sorted(
                 outputs_for_scan,
                 key=lambda x: (x[1].sp_data.spend_key.sec()),
             )
 
-            # Validate each output's script
+            derived = derive_silent_payment_outputs(
+                adjusted_share,
+                [
+                    (out.sp_data.scan_key, out.sp_data.spend_key, out.sp_label)
+                    for _, out in sorted_outputs
+                ],
+            )
+
+            # Validate each output's script against the derived key
             for pos, (out_idx, out) in enumerate(sorted_outputs):
                 if out.script_pubkey is None:
                     # Incomplete PSBT
                     continue
 
-                label = out.sp_label
-                spend_key = out.sp_data.spend_key
-
-                # Compute t_k using full 33-byte adjusted share (BIP-352)
-                t_k = tagged_hash(
-                    "BIP0352/SharedSecret",
-                    adjusted_share + pos.to_bytes(4, "big"),
-                )
-
-                # Handle label
-                if label is not None and label != 0:
-                    label_bytes = label.to_bytes(4, "big")
-                    label_tweak = tagged_hash(
-                        "BIP0352/Label", scan_key.sec() + label_bytes
-                    )
-                    spend_internal = ec_pubkey_parse(spend_key.sec())
-                    ec_pubkey_tweak_add(spend_internal, label_tweak)
-                    spend_tweaked = ec_pubkey_serialize(spend_internal, EC_COMPRESSED)
-                else:
-                    spend_tweaked = spend_key.sec()
-
-                p_internal = ec_pubkey_parse(spend_tweaked)
-                ec_pubkey_tweak_add(p_internal, t_k)
-                p_pubkey = ec_pubkey_serialize(p_internal, EC_COMPRESSED)
-
-                expected_script = Script(b"\x51\x20" + p_pubkey[1:])
-
-                # Compare with actual script
+                expected_script = Script(b"\x51\x20" + derived[pos])
                 if out.script_pubkey.serialize() != expected_script.serialize():
                     raise SPValidationError(
                         f"Output {out_idx}: Script does not match derived "

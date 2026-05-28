@@ -4,7 +4,6 @@ from . import bech32
 from . import hashes
 from . import compact
 from .base import EmbitBase, EmbitError
-from .util.key import ECPubKey, NUMS_H
 
 SIGHASH_ALL = 1
 
@@ -60,12 +59,6 @@ class Script(EmbitBase):
             return "p2tr"
         # unknown type
         return None
-
-    def is_p2tr(self):
-        """
-        Check if the script is a Pay-to-Taproot script.
-        """
-        return self.script_type() == "p2tr"
 
     def write_to(self, stream):
         res = stream.write(compact.to_bytes(len(self.data)))
@@ -217,100 +210,3 @@ def script_sig_p2sh(redeem_script):
 
 def witness_p2wpkh(signature, pubkey, sighash=SIGHASH_ALL):
     return Witness([signature.serialize() + bytes([sighash]), pubkey.sec()])
-
-
-# New helper: extract/validate input pubkey for various script types
-
-
-def get_input_pubkey(
-    prevout_script, script_sig: bytes | str | None = None, witness=None
-) -> ECPubKey:
-    """Extract and validate a public key for an input based on its prevout script type.
-
-    - prevout_script: Script or raw bytes of the prevout scriptPubKey
-    - script_sig: raw bytes or hex string of the scriptSig (if legacy)
-    - witness: Witness object or a list of bytes for segwit/taproot
-
-    Returns ECPubKey() with .valid=False if no suitable compressed pubkey can be determined.
-    """
-    if isinstance(prevout_script, bytes):
-        spk = Script(prevout_script)
-    else:
-        spk = prevout_script
-
-    if isinstance(script_sig, str):
-        try:
-            ss = bytes.fromhex(script_sig)
-        except Exception:
-            ss = b""
-    elif isinstance(script_sig, bytes):
-        ss = script_sig
-    else:
-        ss = b""
-
-    if isinstance(witness, Witness):
-        wstack = witness.items
-    elif isinstance(witness, list):
-        wstack = witness
-    else:
-        wstack = []
-
-    script_type = spk.script_type()
-
-    if script_type == "p2pkh":
-        spk_hash = spk.data[3:23]
-        for i in range(len(ss), 32, -1):
-            if i >= 33:
-                pubkey_bytes = ss[i - 33 : i]
-                if len(pubkey_bytes) == 33 and pubkey_bytes[0] in (0x02, 0x03):
-                    if hashes.hash160(pubkey_bytes) == spk_hash:
-                        pubkey = ECPubKey().set(pubkey_bytes)
-                        if pubkey.valid and pubkey.is_compressed:
-                            return pubkey
-        return ECPubKey()
-
-    if script_type == "p2sh":
-        if len(ss) > 1 and wstack:
-            pubkey_bytes = wstack[-1]
-            pubkey = ECPubKey().set(pubkey_bytes)
-            if pubkey.valid and pubkey.is_compressed:
-                return pubkey
-        return ECPubKey()
-
-    if script_type == "p2wpkh":
-        if wstack:
-            pubkey_bytes = wstack[-1]
-            pubkey = ECPubKey().set(pubkey_bytes)
-            if pubkey.valid and pubkey.is_compressed:
-                return pubkey
-        return ECPubKey()
-
-    if script_type == "p2tr":
-        if wstack:
-            # strip annex if present (last element starting with 0x50)
-            if len(wstack) > 1 and wstack[-1][:1] == b"\x50":
-                wstack = wstack[:-1]
-            # Script-path spend: if control block signals NUMS, skip
-            if len(wstack) > 1:
-                control_block = wstack[-1]
-                if len(control_block) >= 33 and control_block[1:33] == NUMS_H.to_bytes(
-                    32, "big"
-                ):
-                    return ECPubKey()
-            # Key-path spend: reconstruct even-y compressed SEC from x-only
-            if len(spk.data) >= 34:
-                xonly = spk.data[2:34]
-                pubkey_bytes = b"\x02" + xonly
-                pubkey = ECPubKey().set(pubkey_bytes)
-                if pubkey.valid:
-                    return pubkey
-        else:
-            if len(spk.data) >= 34:
-                xonly = spk.data[2:34]
-                pubkey_bytes = b"\x02" + xonly
-                pubkey = ECPubKey().set(pubkey_bytes)
-                if pubkey.valid:
-                    return pubkey
-        return ECPubKey()
-
-    return ECPubKey()

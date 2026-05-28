@@ -1,15 +1,14 @@
 """
 BIP-352: Silent Payments
 see: https://github.com/bitcoin/bips/blob/master/bip-0352.mediawiki
-
-TODO:
-* Implement signing SP spends (once psbt format is settled).
 """
+
+from collections import Counter, defaultdict
+from typing import Tuple, List, Dict
 
 from .. import bech32, ec
 from ..util import secp256k1
 from ..hashes import tagged_hash
-from typing import Tuple, List, Dict
 from ..util.key import SECP256K1_ORDER
 from ..transaction import COutPoint
 from ..util.secp256k1 import (
@@ -21,8 +20,7 @@ from ..util.secp256k1 import (
     ec_seckey_verify,
     ec_privkey_negate,
 )
-from ..script import Script
-from binascii import hexlify, unhexlify
+from binascii import hexlify
 
 
 def generate_silent_payment_address(
@@ -58,11 +56,11 @@ def generate_silent_payment_address(
     return bech32.bech32_encode(bech32.Encoding.BECH32M, hrp, [version] + data)
 
 
-# TODO: use the bech32 decode function once the flexible bech32 PR is in
 def decode_silent_payment_address(address: str) -> Tuple[ec.PublicKey, ec.PublicKey]:
     """
     Decode a silent payment address and return the scan and spend public keys.
-    Silent payment addresses can be longer than 90 characters, so we need custom decoding.
+    Silent payment addresses can be longer than 90 characters, so we use the
+    length-unrestricted bech32 decoder.
     """
     if address.startswith("sp1"):
         hrp = "sp"
@@ -71,41 +69,15 @@ def decode_silent_payment_address(address: str) -> Tuple[ec.PublicKey, ec.Public
     else:
         raise ValueError("Invalid silent payment address: unknown HRP")
 
-    # custom bech32 to bypass the 90-character limit
-    if (any(ord(x) < 33 or ord(x) > 126 for x in address)) or (
-        address.lower() != address and address.upper() != address
-    ):
-        raise ValueError("Invalid silent payment address: invalid characters")
-
-    address = address.lower()
-    pos = address.rfind("1")
-    if pos < 1 or pos + 7 > len(address):
-        raise ValueError("Invalid silent payment address: invalid format")
-
-    if not all(x in bech32.CHARSET for x in address[pos + 1 :]):
-        raise ValueError(
-            "Invalid silent payment address: invalid characters in data part"
-        )
-
-    hrpgot = address[:pos]
-    data = [bech32.CHARSET.find(x) for x in address[pos + 1 :]]
-
-    if hrpgot != hrp:
-        raise ValueError("Invalid silent payment address: HRP mismatch")
-
-    encoding = bech32.bech32_verify_checksum(hrpgot, data)
-    if encoding is None:
-        raise ValueError("Invalid silent payment address: checksum verification failed")
-
+    encoding, hrpgot, data = bech32.bech32_decode_long(address)
+    if encoding is None or data is None:
+        raise ValueError("Invalid silent payment address: decoding failed")
     if encoding != bech32.Encoding.BECH32M:
         raise ValueError("Invalid silent payment address: must use bech32m encoding")
-
-    data = data[:-6]
-
-    if data[0] != 0:
-        raise ValueError(
-            f"Invalid silent payment address: unsupported version {data[0]}"
-        )
+    if hrpgot != hrp:
+        raise ValueError("Invalid silent payment address: HRP mismatch")
+    if not data or data[0] != 0:
+        raise ValueError("Invalid silent payment address: unsupported version")
 
     decoded = bech32.convertbits(data[1:], 5, 8, False)
     if decoded is None:
@@ -166,8 +138,6 @@ def create_outputs(
 
     input_hash = get_input_hash(outpoints, ec_pubkey_serialize(A))
 
-    from collections import Counter, defaultdict
-
     recipient_counts = Counter(recipients)
 
     groups: Dict[ec.PublicKey, List[Tuple[ec.PublicKey, str, int]]] = defaultdict(list)
@@ -200,16 +170,3 @@ def create_outputs(
                 k += 1
 
     return result
-
-
-def generate_sp_destination_address(
-    input_privkeys: List[Tuple[bytes, bool]],
-    outpoints: List["COutPoint"],
-    recipient_sp_address: str,
-) -> str:
-    outputs = create_outputs(input_privkeys, outpoints, [recipient_sp_address])
-
-    dest_addr = []
-    for output in outputs:
-        dest_addr.append(Script(b"\x51\x20" + unhexlify(output)).address())
-    return dest_addr
