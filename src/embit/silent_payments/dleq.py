@@ -53,10 +53,10 @@ def generate_dleq_proof(a_bytes, B_sec, r=None, m=None, G=None):
     Args:
         a_bytes: 32-byte private key scalar.
         B_sec:   33-byte compressed pubkey (alternative base point B).
-        r:       32-byte auxiliary randomness. Must be fresh per proof; reusing r
-                 with the same (a, B) and no m leaks a (fn.1). Since
-                 v0.2.0, m is also mixed in, removing the leak when m differs
-                 (fn.4), but fresh r is still required. Defaults to os.urandom(32).
+        r:       32-byte auxiliary randomness. Required (raises DLEQError if None);
+                 caller must supply fresh entropy. Reusing r with the same (a, B)
+                 and no m leaks a (fn.1). Since v0.2.0, m is also mixed in, removing
+                 the leak when m differs (fn.4), but fresh r is still required.
         m:       Optional 32-byte message to bind into the proof.
         G:       Optional 33-byte compressed base point. Defaults to secp256k1 G.
                  BIP-374 footnote 2 allows any curve point as the generator so

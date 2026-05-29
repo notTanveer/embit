@@ -13,7 +13,7 @@ from typing import List, Optional
 from .. import ec
 from . import dleq
 from .fields import SPValidationError
-from .ecdh import get_eligible_inputs
+from .ecdh import get_eligible_inputs, pubkey_hash_from_script
 from .bip352 import get_input_hash, derive_silent_payment_outputs
 from ..transaction import SIGHASH, COutPoint
 from ..script import Script
@@ -44,7 +44,6 @@ class BIP375Validator:
             psbt: A PSBTv2 instance to validate
         """
         self.psbt = psbt
-        self.errors = []
 
     def has_sp_outputs(self) -> bool:
         """Check if PSBT has any SP outputs."""
@@ -58,13 +57,11 @@ class BIP375Validator:
             skip_output_scripts: Skip stage 4 (output script validation) if True
 
         Returns:
-            True if validation passes, False otherwise
+            True if validation passes (otherwise raises).
 
         Raises:
-            SPValidationError: With details of first validation failure
+            SPValidationError: With details of the first validation failure.
         """
-        self.errors = []
-
         if self.psbt.version != 2:
             # SP fields only allowed in PSBTv2
             if self.has_sp_outputs():
@@ -284,43 +281,16 @@ class BIP375Validator:
         Falls back to partial_sigs keys when bip32_derivations is absent (e.g. a
         trimmed PSBT where the signer stripped BIP-32 metadata to save space).
         """
-        script = inp.script_pubkey
-        if script is None:
+        pkh = pubkey_hash_from_script(inp.script_pubkey, inp.redeem_script)
+        if pkh is None:
             return None
 
-        script_type = script.script_type()
-
-        if script_type == "p2wpkh":
-            # script = 0x00 0x14 <20-byte hash160(pubkey)>
-            pkh = bytes(script.data[2:22])
-            for pubkey in inp.bip32_derivations:
-                if hash160(pubkey.sec()) == pkh:
-                    return pubkey
-            for pubkey in inp.partial_sigs:
-                if hash160(pubkey.sec()) == pkh:
-                    return pubkey
-
-        elif script_type == "p2pkh":
-            # script = 0x76 0xa9 0x14 <20-byte hash160(pubkey)> 0x88 0xac
-            pkh = bytes(script.data[3:23])
-            for pubkey in inp.bip32_derivations:
-                if hash160(pubkey.sec()) == pkh:
-                    return pubkey
-            for pubkey in inp.partial_sigs:
-                if hash160(pubkey.sec()) == pkh:
-                    return pubkey
-
-        elif script_type == "p2sh" and inp.redeem_script:
-            # P2SH-P2WPKH: redeem script = 0x00 0x14 <20-byte hash160(pubkey)>
-            if inp.redeem_script.script_type() == "p2wpkh":
-                pkh = bytes(inp.redeem_script.data[2:22])
-                for pubkey in inp.bip32_derivations:
-                    if hash160(pubkey.sec()) == pkh:
-                        return pubkey
-                for pubkey in inp.partial_sigs:
-                    if hash160(pubkey.sec()) == pkh:
-                        return pubkey
-
+        for pubkey in inp.bip32_derivations:
+            if hash160(pubkey.sec()) == pkh:
+                return pubkey
+        for pubkey in inp.partial_sigs:
+            if hash160(pubkey.sec()) == pkh:
+                return pubkey
         return None
 
     def _validate_input_eligibility(self):
@@ -334,7 +304,7 @@ class BIP375Validator:
         # Get eligible inputs - this will raise if Segwit v>1 found
         try:
             get_eligible_inputs(self.psbt.inputs, has_sp_outputs=True)
-        except Exception as e:
+        except SPValidationError as e:
             raise SPValidationError(f"Invalid input for SP: {e}")
 
         # Check sighash types

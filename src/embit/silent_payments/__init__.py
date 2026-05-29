@@ -32,3 +32,23 @@ from .psbt import (
     SilentPaymentsPSBT,
     finalize_sp_spends,
 )
+
+__all__ = [
+    "bip352",
+    "dleq",
+    "SPFieldError",
+    "SPValidationError",
+    "SilentPaymentData",
+    "compute_ecdh_share",
+    "compute_global_ecdh_share",
+    "compute_dleq_proof",
+    "compute_global_dleq_proof",
+    "get_eligible_inputs",
+    "derive_silent_payment_outputs",
+    "BIP375Validator",
+    "validate_bip375_psbt",
+    "SPInputScope",
+    "SPOutputScope",
+    "SilentPaymentsPSBT",
+    "finalize_sp_spends",
+]

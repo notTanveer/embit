@@ -7,13 +7,14 @@ validator, so they live here to keep those modules free of import cycles.
 """
 
 from .. import ec
+from ..base import EmbitError
 
 
-class SPFieldError(Exception):
+class SPFieldError(EmbitError):
     pass
 
 
-class SPValidationError(Exception):
+class SPValidationError(EmbitError):
     pass
 
 

@@ -43,7 +43,7 @@ def compute_ecdh_share(private_key: bytes, scan_key: ec.PublicKey) -> bytes:
 
 def compute_global_ecdh_share(
     private_keys: List[bytes], scan_key: ec.PublicKey
-) -> bytes:
+) -> Optional[bytes]:
     """
     Compute global ECDH share from multiple private keys.
 
@@ -133,6 +133,29 @@ def compute_global_dleq_proof(
         return dleq.generate_dleq_proof(a_sum_bytes, scan_key.sec(), r=r)
     except dleq.DLEQError as e:
         raise SPFieldError(f"Failed to generate global DLEQ proof: {e}")
+
+
+def pubkey_hash_from_script(script, redeem_script=None) -> Optional[bytes]:
+    """Return the 20-byte HASH160(pubkey) committed by a single-key script.
+
+    Handles the SP-eligible script types (P2WPKH, P2PKH, P2SH-P2WPKH); returns
+    None for any other type. This is the single source of truth for matching a
+    pubkey to an input script, used by both the signer and the validator.
+    """
+    if script is None:
+        return None
+    script_type = script.script_type()
+    if script_type == "p2wpkh":
+        return bytes(script.data[2:22])
+    if script_type == "p2pkh":
+        return bytes(script.data[3:23])
+    if (
+        script_type == "p2sh"
+        and redeem_script is not None
+        and redeem_script.script_type() == "p2wpkh"
+    ):
+        return bytes(redeem_script.data[2:22])
+    return None
 
 
 def get_eligible_inputs(

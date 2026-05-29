@@ -153,14 +153,14 @@ def create_outputs(
     for B_scan, B_spend_list in groups.items():
         ecdh_point = ec_pubkey_parse(B_scan.sec())
         ec_pubkey_tweak_mul(ecdh_point, scalar_bytes)
-        xonly_shared_secret = ec_pubkey_serialize(ecdh_point)
+        shared_secret = ec_pubkey_serialize(ecdh_point)  # 33-byte compressed point
 
         k = 0
         for B_spend, addr, count in B_spend_list:
             for _ in range(count):
                 t_k = tagged_hash(
                     "BIP0352/SharedSecret",
-                    xonly_shared_secret + k.to_bytes(4, "big"),
+                    shared_secret + k.to_bytes(4, "big"),
                 )
 
                 P_k = ec_pubkey_parse(B_spend.sec())

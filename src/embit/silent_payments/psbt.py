@@ -11,6 +11,7 @@ import io
 from collections import OrderedDict
 
 from .. import ec, hashes
+from ..base import EmbitError
 from ..script import Witness
 from ..psbt import (
     PSBT,
@@ -22,7 +23,12 @@ from ..psbt import (
     read_string,
     ser_string,
 )
-from .ecdh import compute_ecdh_share, compute_dleq_proof, get_eligible_inputs
+from .ecdh import (
+    compute_ecdh_share,
+    compute_dleq_proof,
+    get_eligible_inputs,
+    pubkey_hash_from_script,
+)
 from .fields import SilentPaymentData, SPFieldError, SPValidationError
 
 # ── scopes ────────────────────────────────────────────────────────────────────
@@ -315,7 +321,7 @@ class SilentPaymentsPSBT(PSBT):
             return 0
         try:
             pk = key.sp_spend_tweak(sp_tweak)
-        except Exception:
+        except (EmbitError, ValueError):
             return 0
         output_xonly = inp.utxo.script_pubkey.data[2:34]
         if pk.xonly() != output_xonly:
@@ -404,12 +410,11 @@ class SilentPaymentsPSBT(PSBT):
                     break
 
             if priv_bytes is None and fingerprint is None and hasattr(root, "secret"):
-                sp = inp.script_pubkey
-                if sp is not None:
-                    root_pub = root.get_public_key()
-                    pkh = hashes.hash160(root_pub.sec())
-                    if root_pub.sec() in sp.data or pkh in sp.data:
-                        priv_bytes = root.secret
+                pkh = pubkey_hash_from_script(inp.script_pubkey, inp.redeem_script)
+                if pkh is not None and pkh == hashes.hash160(
+                    root.get_public_key().sec()
+                ):
+                    priv_bytes = root.secret
 
             if priv_bytes is None:
                 continue
