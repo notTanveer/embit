@@ -3,14 +3,10 @@ BIP-352: Silent Payments
 see: https://github.com/bitcoin/bips/blob/master/bip-0352.mediawiki
 """
 
-from collections import Counter, defaultdict
-from typing import Tuple, List, Dict
-
 from .. import bech32, ec
 from ..util import secp256k1
 from ..hashes import tagged_hash
 from ..util.key import SECP256K1_ORDER
-from ..transaction import COutPoint
 from ..util.secp256k1 import (
     ec_pubkey_create,
     ec_pubkey_serialize,
@@ -63,7 +59,7 @@ def generate_silent_payment_address(
 
 
 # TODO: use the bech32 decode function once the flexible bech32 PR is in
-def decode_silent_payment_address(address: str) -> Tuple[ec.PublicKey, ec.PublicKey]:
+def decode_silent_payment_address(address: str):
     """
     Decode a silent payment address and return the scan and spend public keys.
     Silent payment addresses can be longer than 90 characters, so we need custom decoding.
@@ -108,7 +104,7 @@ def decode_silent_payment_address(address: str) -> Tuple[ec.PublicKey, ec.Public
 
     if data[0] != 0:
         raise ValueError(
-            f"Invalid silent payment address: unsupported version {data[0]}"
+            "Invalid silent payment address: unsupported version {}".format(data[0])
         )
 
     decoded = bech32.convertbits(data[1:], 5, 8, False)
@@ -119,22 +115,20 @@ def decode_silent_payment_address(address: str) -> Tuple[ec.PublicKey, ec.Public
         B_scan = ec.PublicKey.parse(bytes(decoded[:33]))
         B_spend = ec.PublicKey.parse(bytes(decoded[33:]))
     except Exception as e:
-        raise ValueError(f"Invalid silent payment address: invalid public keys - {e}")
+        raise ValueError(
+            "Invalid silent payment address: invalid public keys - {}".format(e)
+        )
 
     return B_scan, B_spend
 
 
-def get_input_hash(outpoints: List["COutPoint"], sum_pubkey_bytes: bytes) -> bytes:
+def get_input_hash(outpoints, sum_pubkey_bytes: bytes) -> bytes:
     lowest_outpoint = sorted(outpoints, key=lambda o: o.serialize())[0]
     preimage = lowest_outpoint.serialize() + sum_pubkey_bytes
     return tagged_hash("BIP0352/Inputs", preimage)
 
 
-def create_outputs(
-    input_privkeys: List[Tuple[bytes, bool]],
-    outpoints: List["COutPoint"],
-    recipients: List[str],
-) -> Dict[str, List[str]]:
+def create_outputs(input_privkeys, outpoints, recipients):
     """
     Creates silent payment outputs for given recipients.
 
@@ -170,14 +164,16 @@ def create_outputs(
 
     input_hash = get_input_hash(outpoints, ec_pubkey_serialize(A))
 
-    recipient_counts = Counter(recipients)
+    recipient_counts = {}
+    for addr in recipients:
+        recipient_counts[addr] = recipient_counts.get(addr, 0) + 1
 
-    groups: Dict[ec.PublicKey, List[Tuple[ec.PublicKey, str, int]]] = defaultdict(list)
+    groups = {}
     for addr, count in recipient_counts.items():
         B_scan, B_spend = decode_silent_payment_address(addr)
-        groups[B_scan].append((B_spend, addr, count))
+        groups.setdefault(B_scan, []).append((B_spend, addr, count))
 
-    result: Dict[str, List[str]] = {addr: [] for addr in recipient_counts.keys()}
+    result = {addr: [] for addr in recipient_counts.keys()}
     scalar = (int.from_bytes(input_hash, "big") * a_sum) % SECP256K1_ORDER
     scalar_bytes = scalar.to_bytes(32, "big")
 
