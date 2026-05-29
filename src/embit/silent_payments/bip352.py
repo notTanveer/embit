@@ -158,7 +158,9 @@ def create_outputs(input_privkeys, outpoints, recipients):
     scalar_bytes = scalar.to_bytes(32, "big")
 
     for B_scan, B_spend_list in groups.items():
-        ecdh_point = ec_pubkey_parse(B_scan.sec())
+        # bytearray: tweak_* mutate the point in place (required by the pure-Python
+        # secp256k1 backend, and works with the ctypes one too)
+        ecdh_point = bytearray(ec_pubkey_parse(B_scan.sec()))
         ec_pubkey_tweak_mul(ecdh_point, scalar_bytes)
         xonly_shared_secret = ec_pubkey_serialize(ecdh_point)
 
@@ -170,7 +172,7 @@ def create_outputs(input_privkeys, outpoints, recipients):
                     xonly_shared_secret + k.to_bytes(4, "big"),
                 )
 
-                P_k = ec_pubkey_parse(B_spend.sec())
+                P_k = bytearray(ec_pubkey_parse(B_spend.sec()))
                 ec_pubkey_tweak_add(P_k, t_k)
 
                 xonly = ec_pubkey_serialize(P_k)[1:33]
