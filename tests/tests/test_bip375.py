@@ -15,8 +15,6 @@ from embit.silent_payments import (
     SPValidationError,
     SPFieldError,
     SilentPaymentData,
-    ECDHShare,
-    DLEQProof,
 )
 from embit import ec
 
@@ -57,30 +55,6 @@ class TestBIP375FieldParsing(unittest.TestCase):
 
         with self.assertRaises(SPFieldError):
             SilentPaymentData.parse(b"\x00" * 67)  # Too long
-
-    def test_ecdh_share_validate_length(self):
-        """Test ECDHShare validates length."""
-        scan_key = ec.PrivateKey(b"\x01" * 32).get_public_key()
-
-        # Valid
-        share = ECDHShare(scan_key, b"\x02" + b"\x00" * 32)
-        self.assertEqual(len(share.share), 33)
-
-        # Invalid length
-        with self.assertRaises(SPFieldError):
-            ECDHShare(scan_key, b"\x02" + b"\x00" * 31)
-
-    def test_dleq_proof_validate_length(self):
-        """Test DLEQProof validates length."""
-        scan_key = ec.PrivateKey(b"\x01" * 32).get_public_key()
-
-        # Valid
-        proof = DLEQProof(scan_key, b"\x00" * 64)
-        self.assertEqual(len(proof.proof), 64)
-
-        # Invalid length
-        with self.assertRaises(SPFieldError):
-            DLEQProof(scan_key, b"\x00" * 63)
 
 
 class TestBIP375TestVectors(unittest.TestCase):

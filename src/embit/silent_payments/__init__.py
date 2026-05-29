@@ -16,8 +16,6 @@ from .fields import (
     SPFieldError,
     SPValidationError,
     SilentPaymentData,
-    ECDHShare,
-    DLEQProof,
 )
 from .ecdh import (
     compute_ecdh_share,
