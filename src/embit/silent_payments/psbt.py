@@ -1,16 +1,17 @@
 """
-SP-aware PSBT scopes, subclass, and signing orchestrator.
+SP-aware PSBT scopes and subclass.
 
 Sections:
   1. SPInputScope / SPOutputScope — per-input/output BIP-375 field handlers
   2. SilentPaymentsPSBT — PSBT subclass with global SP fields and sign_with() SP hook
-  3. SPSigner — high-level signing wrapper (clear → populate → validate → sign)
+  3. finalize_sp_spends — BIP-376 finalizer for SP spend inputs
 """
 
 import io
 from collections import OrderedDict
 
 from .. import ec, hashes
+from ..script import Witness
 from ..psbt import (
     PSBT,
     DerivationPath,
@@ -428,3 +429,27 @@ class SilentPaymentsPSBT(PSBT):
                     continue
 
         return counter
+
+
+# ── BIP-376 finalizer ───────────────────────────────────────────────────────────
+
+
+def finalize_sp_spends(psbt) -> int:
+    """
+    BIP-376 Finalizer: for each signed SP spend input, construct the final
+    scriptwitness from taproot_key_sig and clear SP-specific fields.
+
+    Returns number of inputs finalized.
+    """
+    count = 0
+    for inp in psbt.inputs:
+        if getattr(inp, "sp_tweak", None) is None:
+            continue
+        if inp.taproot_key_sig is None:
+            continue
+        inp.final_scriptwitness = Witness([inp.taproot_key_sig])
+        inp.taproot_key_sig = None
+        inp.sp_tweak = None
+        inp.sp_spend_bip32_derivations = OrderedDict()
+        count += 1
+    return count

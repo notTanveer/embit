@@ -14,11 +14,10 @@ from .. import ec
 from . import dleq
 from .fields import SPValidationError
 from .ecdh import get_eligible_inputs
-from .outputs import derive_silent_payment_outputs
+from .bip352 import get_input_hash, derive_silent_payment_outputs
 from ..transaction import SIGHASH, COutPoint
 from ..script import Script
 from ..hashes import hash160
-from .bip352 import get_input_hash
 from ..util.secp256k1 import (
     ec_pubkey_combine,
     ec_pubkey_parse,

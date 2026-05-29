@@ -5,9 +5,9 @@ Silent Payments support for embit.
 - dleq:   BIP-374 Discrete Log Equality proofs
 - fields: BIP-375 PSBT field data classes and exceptions
 - ecdh:   ECDH share / DLEQ proof computation and input eligibility
-- outputs: BIP-375 output derivation helper
 - validator: BIP-375 PSBT 4-stage validation pipeline
-- psbt: SP-aware scopes and PSBT subclass with the sign_with() SP hook
+- psbt: SP-aware scopes, PSBT subclass with the sign_with() SP hook, and
+        the BIP-376 finalize_sp_spends finalizer
 """
 
 from . import bip352
@@ -26,7 +26,11 @@ from .ecdh import (
     compute_global_dleq_proof,
     get_eligible_inputs,
 )
-from .outputs import derive_silent_payment_outputs
+from .bip352 import derive_silent_payment_outputs
 from .validator import BIP375Validator, validate_bip375_psbt
-from .psbt import SPInputScope, SPOutputScope, SilentPaymentsPSBT
-from .finalizer import finalize_sp_spends
+from .psbt import (
+    SPInputScope,
+    SPOutputScope,
+    SilentPaymentsPSBT,
+    finalize_sp_spends,
+)
