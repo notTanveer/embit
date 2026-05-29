@@ -7,13 +7,15 @@ from .arguments import KeyOrigin, Key
 
 SPSCAN_HRPS = {"spscan": "main", "tspscan": "test"}
 SPSPEND_HRPS = {"spspend": "main", "tspspend": "test"}
-SP_KEY_HRPS = {**SPSCAN_HRPS, **SPSPEND_HRPS}
+SP_KEY_HRPS = SPSCAN_HRPS.copy()
+SP_KEY_HRPS.update(SPSPEND_HRPS)
 
 
 def _bech32m_decode_sp_key(encoded):
-    encoding, hrp, data = bech32.bech32_decode_long(encoded)
-    if encoding is None:
-        raise DescriptorError("Invalid bech32m encoding in SP key: %s" % encoded)
+    try:
+        encoding, hrp, data = bech32.bech32_decode(encoded)
+    except bech32.Bech32DecodeError as e:
+        raise DescriptorError("Invalid bech32m encoding in SP key: %s" % e)
     if encoding != bech32.Encoding.BECH32M:
         raise DescriptorError("SP key must use bech32m encoding")
     if hrp not in SP_KEY_HRPS:
@@ -23,8 +25,9 @@ def _bech32m_decode_sp_key(encoded):
     version = data[0]
     if version != 0:
         raise DescriptorError("Unsupported SP key version: %d" % version)
-    payload = bech32.convertbits(data[1:], 5, 8, False)
-    if payload is None:
+    try:
+        payload = bech32.convertbits(data[1:], 5, 8, False)
+    except bech32.Bech32DecodeError:
         raise DescriptorError("Invalid SP key payload encoding")
     return hrp, bytes(payload)
 
@@ -267,6 +270,21 @@ class SilentPaymentDescriptor(DescriptorBase):
                 raise DescriptorError("Uncompressed keys are not allowed in sp()")
 
         return cls(scan_key=scan_key, spend_key=spend_arg)
+
+    def derive(self, *args, **kwargs):
+        raise DescriptorError(
+            "sp() descriptors do not support derive(); see BIP-352 for output derivation"
+        )
+
+    def script_pubkey(self, *args, **kwargs):
+        raise DescriptorError(
+            "sp() descriptors have no fixed script_pubkey(); outputs are derived per BIP-352"
+        )
+
+    def address(self, *args, **kwargs):
+        raise DescriptorError(
+            "sp() descriptors have no address(); use BIP-352 silent payment address generation"
+        )
 
     def to_string(self):
         if self.sp_key is not None:

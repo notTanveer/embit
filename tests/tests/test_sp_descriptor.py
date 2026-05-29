@@ -1,5 +1,5 @@
 from unittest import TestCase
-from embit.descriptor import SilentPaymentDescriptor
+from embit.descriptor import Descriptor, SilentPaymentDescriptor
 from embit.descriptor.sp import SPScanKey, SPSpendKey
 from embit.descriptor.arguments import KeyOrigin
 from embit.descriptor.errors import DescriptorError
@@ -88,6 +88,19 @@ class TestMnemonicVectors(TestCase):
             desc = SilentPaymentDescriptor.from_string("sp(%s)" % spscan.encode())
             self.assertEqual(desc.get_scan_privkey().secret, scan_priv.secret)
             self.assertEqual(desc.get_spend_pubkey().sec(), spend_pub.sec())
+
+    def test_descriptor_from_string_dispatches_to_sp(self):
+        """Descriptor.from_string('sp(...)') returns a SilentPaymentDescriptor."""
+        for v in VECTORS:
+            net, scan_priv, _, spend_pub = self._keys(v)
+            desc_str = "sp(%s)" % SPScanKey(scan_priv, spend_pub, network=net).encode()
+            desc = Descriptor.from_string(desc_str)
+            self.assertIsInstance(desc, SilentPaymentDescriptor)
+            self.assertEqual(str(desc), desc_str)
+            # Unsupported standard descriptor operations raise a clear error
+            self.assertRaises(DescriptorError, desc.address)
+            self.assertRaises(DescriptorError, desc.derive, 0)
+            self.assertRaises(DescriptorError, desc.script_pubkey)
 
 
 class TestKeyOrigin(TestCase):
@@ -248,30 +261,40 @@ class TestInvalidDescriptor(TestCase):
         scan_pub = self._scan_priv().get_public_key()
         spend_pub = self._spend_pub()
         desc_str = "sp(%s,%s)" % (scan_pub.sec().hex(), spend_pub.sec().hex())
-        self.assertRaises(DescriptorError, SilentPaymentDescriptor.from_string, desc_str)
+        self.assertRaises(
+            DescriptorError, SilentPaymentDescriptor.from_string, desc_str
+        )
 
     def test_spscan_in_second_position_rejected(self):
         """Two-arg sp(wif, spscan1...) is rejected — second arg cannot be an spscan key."""
         scan_priv = self._scan_priv()
         spscan = SPScanKey(scan_priv, self._spend_pub())
         desc_str = "sp(%s,%s)" % (scan_priv.wif(), spscan.encode())
-        self.assertRaises(DescriptorError, SilentPaymentDescriptor.from_string, desc_str)
+        self.assertRaises(
+            DescriptorError, SilentPaymentDescriptor.from_string, desc_str
+        )
 
     def test_two_spscan_args_rejected(self):
         """sp(spscan1..., spscan1...) is rejected — spscan must be the only argument."""
         spscan = SPScanKey(self._scan_priv(), self._spend_pub())
         desc_str = "sp(%s,%s)" % (spscan.encode(), spscan.encode())
-        self.assertRaises(DescriptorError, SilentPaymentDescriptor.from_string, desc_str)
+        self.assertRaises(
+            DescriptorError, SilentPaymentDescriptor.from_string, desc_str
+        )
 
     def test_uncompressed_scan_key_rejected(self):
         """Uncompressed private key as scan arg is rejected."""
         scan_priv = ec.PrivateKey(bytes([0x01] * 32), compressed=False)
         spend_pub = self._spend_pub()
         desc_str = "sp(%s,%s)" % (scan_priv.wif(), spend_pub.sec().hex())
-        self.assertRaises(DescriptorError, SilentPaymentDescriptor.from_string, desc_str)
+        self.assertRaises(
+            DescriptorError, SilentPaymentDescriptor.from_string, desc_str
+        )
 
     def test_trailing_junk_rejected(self):
         """Characters after the closing ) are rejected."""
         spscan = SPScanKey(self._scan_priv(), self._spend_pub())
         desc_str = "sp(%s)junk" % spscan.encode()
-        self.assertRaises(DescriptorError, SilentPaymentDescriptor.from_string, desc_str)
+        self.assertRaises(
+            DescriptorError, SilentPaymentDescriptor.from_string, desc_str
+        )

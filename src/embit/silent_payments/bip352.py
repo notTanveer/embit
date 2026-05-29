@@ -62,7 +62,6 @@ def generate_silent_payment_address(
 def decode_silent_payment_address(address: str):
     """
     Decode a silent payment address and return the scan and spend public keys.
-    Silent payment addresses can be longer than 90 characters, so we need custom decoding.
     """
     if address.startswith("sp1"):
         hrp = "sp"
@@ -71,44 +70,25 @@ def decode_silent_payment_address(address: str):
     else:
         raise ValueError("Invalid silent payment address: unknown HRP")
 
-    # custom bech32 to bypass the 90-character limit
-    if (any(ord(x) < 33 or ord(x) > 126 for x in address)) or (
-        address.lower() != address and address.upper() != address
-    ):
-        raise ValueError("Invalid silent payment address: invalid characters")
-
-    address = address.lower()
-    pos = address.rfind("1")
-    if pos < 1 or pos + 7 > len(address):
-        raise ValueError("Invalid silent payment address: invalid format")
-
-    if not all(x in bech32.CHARSET for x in address[pos + 1 :]):
-        raise ValueError(
-            "Invalid silent payment address: invalid characters in data part"
-        )
-
-    hrpgot = address[:pos]
-    data = [bech32.CHARSET.find(x) for x in address[pos + 1 :]]
+    try:
+        encoding, hrpgot, data = bech32.bech32_decode(address)
+    except bech32.Bech32DecodeError as e:
+        raise ValueError("Invalid silent payment address: {}".format(e))
 
     if hrpgot != hrp:
         raise ValueError("Invalid silent payment address: HRP mismatch")
 
-    encoding = bech32.bech32_verify_checksum(hrpgot, data)
-    if encoding is None:
-        raise ValueError("Invalid silent payment address: checksum verification failed")
-
     if encoding != bech32.Encoding.BECH32M:
         raise ValueError("Invalid silent payment address: must use bech32m encoding")
-
-    data = data[:-6]
 
     if data[0] != 0:
         raise ValueError(
             "Invalid silent payment address: unsupported version {}".format(data[0])
         )
 
-    decoded = bech32.convertbits(data[1:], 5, 8, False)
-    if decoded is None:
+    try:
+        decoded = bech32.convertbits(data[1:], 5, 8, False)
+    except bech32.Bech32DecodeError:
         raise ValueError("Invalid silent payment address: conversion failed")
 
     try:

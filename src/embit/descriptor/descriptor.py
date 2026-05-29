@@ -296,6 +296,7 @@ class Descriptor(DescriptorBase):
     @classmethod
     def read_from(cls, s):
         # starts with sh(wsh()), sh() or wsh()
+        start_pos = s.tell()
         start = s.read(8)
         sh = False
         wsh = False
@@ -304,7 +305,8 @@ class Descriptor(DescriptorBase):
         taproot = False
         taptree = TapTree()
         if start.startswith(b"sp("):
-            s.seek(-5, 1)
+            # position right after "sp(" (absolute, robust to a short read(8))
+            s.seek(start_pos + 3)
             sp_desc = SilentPaymentDescriptor.read_from(s)
             end = s.read(1)
             if end != b")":
