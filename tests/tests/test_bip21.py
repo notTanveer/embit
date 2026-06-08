@@ -72,3 +72,33 @@ class Bip21Test(TestCase):
         # bc parameters should be normalized to lowercase
         self.assertEqual(uri2.get_bc_addresses()[0], "bc1qufgy354j3kmvuch987xe4s40836x3h0lg8f5n2")
         self.assertEqual(uri2.get_bc_addresses()[1], "bc1p5swkugezn97763tl0yty6556856uug0q6jflljvep9m4p7339x5qzyrh4g")
+
+    def test_silent_payment_addresses(self):
+        """sp parameters are validated via BIP-352 (bech32m, version, keys)"""
+        mainnet = "sp1qqgste7k9hx0qftg6qmwlkqtwuy6cycyavzmzj85c6qdfhjdpdjtdgqjuexzk6murw56suy3e0rd2cgqvycxttddwsvgxe2usfpxumr70xc9pkqwv"
+
+        # Single mainnet sp address
+        uri = bip21.BitcoinURI("bitcoin:?sp=" + mainnet)
+        self.assertIsNone(uri.get_address())
+        self.assertEqual(uri.get_silent_payment_addresses(), [mainnet])
+
+        # Multiple sp addresses are allowed (payment instruction field)
+        uri = bip21.BitcoinURI("bitcoin:?sp={0}&sp={0}".format(mainnet))
+        self.assertEqual(uri.get_silent_payment_addresses(), [mainnet, mainnet])
+
+    def test_testnet_silent_payment_address(self):
+        """Testnet sp addresses (tsp1) are now accepted via BIP-352 decoding"""
+        testnet = "tsp1qqtxnkt3n7rrjxnz5mqtlrafnm50ghpljsnus4qy53dxmayc5kg48cq6zu25tt40wgf3yy6c7c32q68ensehyhf3jnsv4vcedj67xvyrn6uwh6pwr"
+        uri = bip21.BitcoinURI("bitcoin:?sp=" + testnet)
+        self.assertEqual(uri.get_silent_payment_addresses(), [testnet])
+
+    def test_invalid_silent_payment_address(self):
+        """Malformed sp addresses are rejected (not just a prefix check)"""
+        # Valid prefix but corrupted bech32m checksum (last char flipped)
+        bad_checksum = "sp1qqgste7k9hx0qftg6qmwlkqtwuy6cycyavzmzj85c6qdfhjdpdjtdgqjuexzk6murw56suy3e0rd2cgqvycxttddwsvgxe2usfpxumr70xc9pkqwq"
+        with self.assertRaises(bip21.BIP21Error):
+            bip21.BitcoinURI("bitcoin:?sp=" + bad_checksum)
+
+        # Right HRP, but not a real silent payment payload
+        with self.assertRaises(bip21.BIP21Error):
+            bip21.BitcoinURI("bitcoin:?sp=sp1qqqqqqqqqqqq")

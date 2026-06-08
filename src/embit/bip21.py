@@ -154,16 +154,21 @@ class BitcoinURI(EmbitBase):
                 raise BIP21Error(f"'{value}' is not a valid Bech32m address: {e}")
         
         elif name == self.FIELD_SILENT_PAYMENT and value:
-            # Parse silent payment address and add to list
+            # Parse and fully validate the silent payment address via BIP-352.
+            # Imported lazily so plain bitcoin: URIs don't pull in the whole
+            # silent_payments package.
+            from .silent_payments.bip352 import decode_silent_payment_address
+
+            decoded_sp = unquote(value)
             try:
-                decoded_sp = unquote(value)
-                # Basic validation for silent payment address format
-                if not decoded_sp.startswith('sp1'):
-                    raise ValueError("Silent payment address must start with 'sp1'")
-                # Add to list of silent payment addresses
-                self.parameters[self.FIELD_SILENT_PAYMENT].append(decoded_sp.lower())
+                # Verifies the HRP (sp = mainnet, tsp = testnet), the bech32m
+                # checksum, the version byte, and that the scan and spend keys
+                # are valid secp256k1 points.
+                decode_silent_payment_address(decoded_sp)
             except Exception as e:
                 raise BIP21Error(f"'{value}' is not a valid silent payment address: {e}")
+            # Store normalized to lowercase (bech32m is case-insensitive)
+            self.parameters[self.FIELD_SILENT_PAYMENT].append(decoded_sp.lower())
         
         elif name.startswith("req-"):
             # Required parameter we don't know about
