@@ -27,6 +27,9 @@ from . import dleq
 from .ecdh import (
     compute_ecdh_share,
     compute_dleq_proof,
+    compute_global_ecdh_share,
+    compute_global_dleq_proof,
+    derive_sp_output_scripts,
     get_eligible_inputs,
     pubkey_hash_from_script,
     input_public_key,
@@ -202,31 +205,36 @@ class SilentPaymentsPSBT(PSBT):
         self.sp_dleq_proofs = OrderedDict()  # scan_key -> dleq_proof (64 bytes)
         super().__init__(*args, **kwargs)
 
+    @property
+    def has_sp_outputs(self) -> bool:
+        """Whether this PSBT has any Silent Payment output (BIP-375)."""
+        return any(out.sp_data is not None for out in self.outputs)
+
+    @property
+    def has_sp_spend_inputs(self) -> bool:
+        """Whether this PSBT has any input spending a previously-received
+        Silent Payment output (BIP-376)."""
+        return any(inp.sp_tweak is not None for inp in self.inputs)
+
+    @property
+    def has_sp_content(self) -> bool:
+        """Whether this PSBT carries any Silent Payment data at all (send or spend)."""
+        return self.has_sp_outputs or self.has_sp_spend_inputs
+
     @classmethod
     def _validate_v2_output(cls, out, i):
+        """Same as PSBT._validate_v2_output, but SP outputs may omit
+        PSBT_OUT_SCRIPT (the taproot script is derived from ECDH shares, not
+        known up front). Used by both the parser and add_output() (see
+        base PSBT.add_output)."""
         if out.value is None:
             raise PSBTError(
                 "PSBTv2 output %d missing required PSBT_OUT_AMOUNT (0x03)" % i
             )
-        if out.script_pubkey is None and getattr(out, "sp_data", None) is None:
+        if out.script_pubkey is None and out.sp_data is None:
             raise PSBTError(
                 "PSBTv2 output %d missing required PSBT_OUT_SCRIPT (0x04)" % i
             )
-
-    def add_output(self, output_scope):
-        if not self.is_outputs_modifiable():
-            raise PSBTError("Outputs are not modifiable")
-        if self.version == 2:
-            if output_scope.value is None:
-                raise PSBTError("PSBTv2 output must have PSBT_OUT_AMOUNT")
-            if (
-                output_scope.script_pubkey is None
-                and getattr(output_scope, "sp_data", None) is None
-            ):
-                raise PSBTError("PSBTv2 output must have PSBT_OUT_SCRIPT")
-        self.outputs.append(output_scope)
-        if self.version == 2:
-            self._raw_output_count_from_global = len(self.outputs)
 
     def parse_unknowns(self):
         super().parse_unknowns()
@@ -264,9 +272,7 @@ class SilentPaymentsPSBT(PSBT):
         return r
 
     def sign_with(self, root, sighash=None, with_sp_shares=True, **kwargs):
-        has_sp = self.version == 2 and any(
-            out.sp_data is not None for out in self.outputs
-        )
+        has_sp = self.version == 2 and self.has_sp_outputs
         # BIP-375: only SIGHASH_ALL may be used when SP outputs are present.
         # SIGHASH.DEFAULT (taproot) is functionally SIGHASH_ALL.
         if (
@@ -534,14 +540,123 @@ class SilentPaymentsPSBT(PSBT):
                 if sk_bytes in inp.sp_ecdh_shares:
                     continue
                 share = compute_ecdh_share(priv_bytes, scan_key)
+                # verify=False: share was just derived from these exact
+                # (priv_bytes, scan_key), so the self-check would only repeat
+                # the scalar multiplication we already paid for above.
                 proof = compute_dleq_proof(
-                    priv_bytes, scan_key, share, aux_rand=aux_rand
+                    priv_bytes, scan_key, share, aux_rand=aux_rand, verify=False
                 )
                 inp.sp_ecdh_shares[sk_bytes] = share
                 inp.sp_dleq_proofs[sk_bytes] = proof
                 counter += 1
 
         return counter
+
+    def fill_output_scripts(self, eligible=None) -> bool:
+        """Derive and assign the taproot scriptPubKey for every SP output
+        whose ECDH share is already resolvable (see
+        ``ecdh.derive_sp_output_scripts``).
+
+        Returns False (no-op) if any SP output's share isn't yet resolvable
+        (an incomplete multi-party PSBT); True otherwise, including the
+        no-SP-outputs case.
+        """
+        sp_out_idxs = [i for i, o in enumerate(self.outputs) if o.sp_data is not None]
+        if not sp_out_idxs:
+            return True
+
+        resolved = derive_sp_output_scripts(self, eligible=eligible)
+        if len(resolved) != len(sp_out_idxs):
+            return False
+
+        for out_idx, spk in resolved.items():
+            self.outputs[out_idx].script_pubkey = spk
+        return True
+
+    def sign_single_party(self, root, aux_rand=None) -> int:
+        """BIP-375 single-signer Silent Payment send: this signer controls
+        every eligible input and acts as its own output generator.
+
+        Runs the full orchestration a single-party signer needs: clear any
+        stale SP fields, compute per-input ECDH shares, derive and fill the
+        SP output scripts those shares unlock, replace the per-input shares
+        with the smaller BIP-375 global share/proof pair (a signer covering
+        all inputs SHOULD prefer the global fields), then sign every input.
+
+        Raises SPValidationError if an eligible input is not controlled by
+        ``root`` (multi-party Silent Payment sends are out of scope for a
+        stateless single-party signer), if no eligible input matches ``root``
+        at all, or if the SP output scripts cannot be resolved even though
+        this signer controls every eligible input.
+        """
+        if not (self.version == 2 and self.has_sp_outputs):
+            return self.sign_with(root)
+
+        scan_key_objects = {}
+        for out in self.outputs:
+            if out.sp_data is not None:
+                scan_key_objects[out.sp_data.scan_key.sec()] = out.sp_data.scan_key
+
+        eligible = get_eligible_inputs(self.inputs, has_sp_outputs=True)
+        if not eligible:
+            raise SPValidationError(
+                "Silent Payment send requires at least one eligible input "
+                "(P2PKH, P2SH-P2WPKH, P2WPKH, or P2TR)."
+            )
+
+        fingerprint, _ = self._signing_fingerprint(root)
+        priv_keys = []
+        foreign_inputs = []
+        for i in eligible:
+            priv = self._resolve_input_privkey(self.inputs[i], root, fingerprint)
+            if priv is None:
+                foreign_inputs.append(i)
+            else:
+                priv_keys.append(priv)
+
+        if foreign_inputs:
+            if priv_keys:
+                raise SPValidationError(
+                    "Silent Payment signing failed: input(s) {} belong to another "
+                    "signer; multi-party Silent Payment sends are not "
+                    "supported.".format(
+                        ", ".join(str(i) for i in foreign_inputs)
+                    )
+                )
+            raise SPValidationError(
+                "Silent Payment signing failed: no eligible input is controlled "
+                "by this seed (check derivation / fingerprint)."
+            )
+
+        self.sp_ecdh_shares.clear()
+        self.sp_dleq_proofs.clear()
+        for inp in self.inputs:
+            inp.sp_ecdh_shares.clear()
+            inp.sp_dleq_proofs.clear()
+
+        self._sign_with_sp(root, aux_rand=aux_rand)
+
+        if not self.fill_output_scripts(eligible=eligible):
+            raise SPValidationError(
+                "Silent Payment signing failed: could not derive output "
+                "scripts; an eligible input's public key is unrecoverable "
+                "(missing PSBT_IN_BIP32_DERIVATION / PSBT_IN_PARTIAL_SIG)."
+            )
+
+        for sk_bytes, scan_key in scan_key_objects.items():
+            global_share = compute_global_ecdh_share(priv_keys, scan_key)
+            if global_share is None:
+                continue
+            self.sp_ecdh_shares[sk_bytes] = global_share
+            # verify=False: global_share was just derived using priv and scan keys
+            self.sp_dleq_proofs[sk_bytes] = compute_global_dleq_proof(
+                priv_keys, scan_key, global_share, aux_rand=aux_rand, verify=False
+            )
+            for inp in self.inputs:
+                inp.sp_ecdh_shares.pop(sk_bytes, None)
+                inp.sp_dleq_proofs.pop(sk_bytes, None)
+
+        return self.sign_with(root, with_sp_shares=False)
 
 
 # ── BIP-376 finalizer ───────────────────────────────────────────────────────────

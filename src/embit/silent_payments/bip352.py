@@ -22,6 +22,36 @@ from binascii import hexlify
 K_MAX = 2323
 
 
+def apply_label(spend_pubkey: ec.PublicKey, scan_privkey: ec.PrivateKey, m: int) -> ec.PublicKey:
+    """
+    BIP-352 label tweak: B_m = B_spend + tagged_hash("BIP0352/Label", scan_priv || ser32(m))·G
+
+    `m` is a 32-bit unsigned integer. `m = 0` is reserved for change; callers
+    that expose labels to users (e.g. address generation) should reject it
+    themselves — this primitive allows it since change derivation needs it.
+    """
+    if not isinstance(m, int) or isinstance(m, bool):
+        raise TypeError("Label must be an int.")
+    if not 0 <= m <= 0xFFFFFFFF:
+        raise ValueError("Label must be a 32-bit unsigned integer in [0, 2**32 - 1].")
+    tweak = tagged_hash("BIP0352/Label", scan_privkey.secret + m.to_bytes(4, "big"))
+    return ec.PublicKey(
+        secp256k1.ec_pubkey_add(secp256k1.ec_pubkey_parse(spend_pubkey.sec()), tweak)
+    )
+
+
+def encode_silent_payment_address(
+    scan_pubkey: ec.PublicKey,
+    spend_pubkey: ec.PublicKey,
+    network: str = "main",
+    version: int = 0,
+) -> str:
+    """Bech32m-encode a BIP-352 Silent Payment address from its scan/spend public keys."""
+    data = bech32.convertbits(scan_pubkey.sec() + spend_pubkey.sec(), 8, 5)
+    hrp = "sp" if network == "main" else "tsp"
+    return bech32.bech32_encode(bech32.Encoding.BECH32M, hrp, [version] + data)
+
+
 def generate_silent_payment_address(
     scan_privkey: ec.PrivateKey,
     spend_pubkey: ec.PublicKey,
@@ -48,17 +78,11 @@ def generate_silent_payment_address(
             raise ValueError(
                 "Label must be a 32-bit unsigned integer in [1, 2**32 - 1]."
             )
-        label_bytes = label.to_bytes(4, "big")
-        tweak = tagged_hash("BIP0352/Label", scan_privkey.secret + label_bytes)
-        spend_pubkey = ec.PublicKey(
-            secp256k1.ec_pubkey_add(
-                secp256k1.ec_pubkey_parse(spend_pubkey.sec()), tweak
-            )
-        )
+        spend_pubkey = apply_label(spend_pubkey, scan_privkey, label)
 
-    data = bech32.convertbits(scan_pubkey.sec() + spend_pubkey.sec(), 8, 5)
-    hrp = "sp" if network == "main" else "tsp"
-    return bech32.bech32_encode(bech32.Encoding.BECH32M, hrp, [version] + data)
+    return encode_silent_payment_address(
+        scan_pubkey, spend_pubkey, network=network, version=version
+    )
 
 
 def decode_silent_payment_address(address: str):

@@ -286,3 +286,42 @@ class BIP352Test(TestCase):
         self.assertEqual(result[addr_x][1], out_x[2])  # second X -> k=2
         # The old count-collapsing code assigned the second X to k=1.
         self.assertNotEqual(result[addr_x][1], out_x[1])
+
+    def test_encode_matches_generate_unlabeled(self):
+        """encode_silent_payment_address is the same encoding
+        generate_silent_payment_address falls back to when there's no label."""
+        scan_priv = PrivateKey(b"\x11" * 32)
+        spend_pub = PrivateKey(b"\x22" * 32).get_public_key()
+
+        expected = bip352.generate_silent_payment_address(scan_priv, spend_pub)
+        actual = bip352.encode_silent_payment_address(
+            scan_priv.get_public_key(), spend_pub
+        )
+        self.assertEqual(actual, expected)
+
+    def test_apply_label_matches_generate_labeled(self):
+        """apply_label + encode_silent_payment_address reproduces what
+        generate_silent_payment_address does internally for a label."""
+        scan_priv = PrivateKey(b"\x11" * 32)
+        spend_pub = PrivateKey(b"\x22" * 32).get_public_key()
+        m = 7
+
+        expected = bip352.generate_silent_payment_address(scan_priv, spend_pub, label=m)
+        labeled_spend = bip352.apply_label(spend_pub, scan_priv, m)
+        actual = bip352.encode_silent_payment_address(
+            scan_priv.get_public_key(), labeled_spend
+        )
+        self.assertEqual(actual, expected)
+
+    def test_apply_label_allows_zero_for_change(self):
+        """m = 0 is reserved for change and generate_silent_payment_address
+        forbids it, but apply_label itself must allow it (used by change
+        detection, not address generation)."""
+        scan_priv = PrivateKey(b"\x11" * 32)
+        spend_pub = PrivateKey(b"\x22" * 32).get_public_key()
+
+        with pytest.raises(ValueError):
+            bip352.generate_silent_payment_address(scan_priv, spend_pub, label=0)
+
+        # Should not raise.
+        bip352.apply_label(spend_pub, scan_priv, 0)

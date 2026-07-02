@@ -1554,11 +1554,10 @@ class PSBT(EmbitBase):
         if not self.is_outputs_modifiable():
             raise PSBTError("Outputs are not modifiable")
         if self.version == 2:
-            # BIP370 Constructor role: validate required fields
-            if output_scope.value is None:
-                raise PSBTError("PSBTv2 output must have PSBT_OUT_AMOUNT")
-            if output_scope.script_pubkey is None:
-                raise PSBTError("PSBTv2 output must have PSBT_OUT_SCRIPT")
+            # BIP370 Constructor role: validate required fields. Subclasses
+            # (e.g. SilentPaymentsPSBT) override _validate_v2_output to admit
+            # alternative fields instead of overriding add_output itself.
+            self._validate_v2_output(output_scope, len(self.outputs))
         self.outputs.append(output_scope)
         if self.version == 2:
             self._raw_output_count_from_global = len(self.outputs)

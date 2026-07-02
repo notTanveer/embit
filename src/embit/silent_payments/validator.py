@@ -11,25 +11,8 @@ Implements the 4-stage validation pipeline for Silent Payments in PSBTs:
 from .. import ec
 from . import dleq
 from .fields import SPValidationError
-from .ecdh import get_eligible_inputs, input_public_key
-from .bip352 import get_input_hash, derive_silent_payment_outputs
-from ..transaction import SIGHASH, COutPoint
-from ..script import Script
-from ..util.secp256k1 import (
-    ec_pubkey_combine,
-    ec_pubkey_parse,
-    ec_pubkey_serialize,
-    ec_pubkey_tweak_mul,
-    EC_COMPRESSED,
-)
-
-
-def _sum_pubkeys(pubkeys) -> bytes:
-    """Sum a non-empty list of public keys, returning a 33-byte compressed point."""
-    acc = ec_pubkey_parse(pubkeys[0].sec())
-    for pk in pubkeys[1:]:
-        acc = ec_pubkey_combine(acc, ec_pubkey_parse(pk.sec()))
-    return ec_pubkey_serialize(acc, EC_COMPRESSED)
+from .ecdh import derive_sp_output_scripts, get_eligible_inputs, input_public_key, sum_pubkeys
+from ..transaction import SIGHASH
 
 
 class BIP375Validator:
@@ -44,7 +27,7 @@ class BIP375Validator:
 
     def has_sp_outputs(self) -> bool:
         """Check if PSBT has any SP outputs."""
-        return any(out.sp_data is not None for out in self.psbt.outputs)
+        return self.psbt.has_sp_outputs
 
     def validate(self, skip_output_scripts: bool = False) -> bool:
         """
@@ -241,7 +224,7 @@ class BIP375Validator:
                 "with public keys".format(out_idx)
             )
 
-        A_sum_bytes = _sum_pubkeys(eligible_pubkeys)
+        A_sum_bytes = sum_pubkeys(eligible_pubkeys)
 
         # Get ECDH share as public key
         ecdh_share = self.psbt.sp_ecdh_shares[scan_key_bytes]
@@ -320,16 +303,8 @@ class BIP375Validator:
         - Verify script is correctly derived from SP data and ECDH shares
         - Verify sorting of outputs by scan/spend keys
         """
-        # Get eligible inputs
         eligible_inputs = get_eligible_inputs(self.psbt.inputs, has_sp_outputs=True)
 
-        # Build outpoints and A_sum for input_hash (same for all scan-key groups).
-        # BIP-352 input_hash commits to the smallest outpoint over ALL transaction
-        # inputs (not just the eligible ones), while A is the sum of eligible keys.
-        outpoints = [
-            COutPoint(txid=self.psbt.tx.vin[i].txid, out_idx=self.psbt.tx.vin[i].vout)
-            for i in range(len(self.psbt.inputs))
-        ]
         eligible_pubkeys = [
             input_public_key(self.psbt.inputs[i]) for i in eligible_inputs
         ]
@@ -338,75 +313,31 @@ class BIP375Validator:
             raise SPValidationError(
                 "Cannot validate output scripts: no eligible input public keys found"
             )
-        A_sum_bytes = _sum_pubkeys(eligible_pubkeys)
-        input_hash = get_input_hash(outpoints, A_sum_bytes)
 
-        # Group SP outputs by scan key, preserving output-index order. The
-        # derivation counter k is the output's position within its scan-key
-        # group in this order (BIP-375: outputs are placed in the order that
-        # determines k; outputs sharing scan+spend are ordered by output index).
-        sp_outputs_by_scan = {}
+        derived_scripts = derive_sp_output_scripts(self.psbt, eligible=eligible_inputs)
+
         for out_idx, out in enumerate(self.psbt.outputs):
-            if out.sp_data is not None:
-                scan_key_bytes = out.sp_data.scan_key.sec()
-                if scan_key_bytes not in sp_outputs_by_scan:
-                    sp_outputs_by_scan[scan_key_bytes] = []
-                sp_outputs_by_scan[scan_key_bytes].append((out_idx, out))
+            if out.sp_data is None:
+                continue
 
-        # For each scan key, validate outputs
-        for scan_key_bytes, outputs_for_scan in sp_outputs_by_scan.items():
-            # Get ECDH share for this scan key
-            ecdh_share = None
-            if scan_key_bytes in self.psbt.sp_ecdh_shares:
-                ecdh_share = self.psbt.sp_ecdh_shares[scan_key_bytes]
-            else:
-                # Sum per-input shares
-                share_sum = None
-                for inp_idx in eligible_inputs:
-                    inp = self.psbt.inputs[inp_idx]
-                    if scan_key_bytes in inp.sp_ecdh_shares:
-                        share = ec_pubkey_parse(inp.sp_ecdh_shares[scan_key_bytes])
-                        if share_sum is None:
-                            share_sum = share
-                        else:
-                            share_sum = ec_pubkey_combine(share_sum, share)
-                if share_sum is not None:
-                    ecdh_share = ec_pubkey_serialize(share_sum, EC_COMPRESSED)
-
-            if not ecdh_share:
+            if out_idx not in derived_scripts:
                 # Incomplete PSBT (output scripts not yet set) legitimately lacks
                 # ECDH shares; only fail if a script is actually present to check.
-                if any(out.script_pubkey is not None for _, out in outputs_for_scan):
+                if out.script_pubkey is not None:
                     raise SPValidationError(
                         "No ECDH share found for scan key in outputs"
                     )
                 continue
 
-            # Apply input_hash: adjusted_share = input_hash · ecdh_share (BIP-352)
-            adjusted_handle = bytearray(ec_pubkey_parse(ecdh_share))
-            ec_pubkey_tweak_mul(adjusted_handle, input_hash)
-            adjusted_share = ec_pubkey_serialize(adjusted_handle, EC_COMPRESSED)
+            if out.script_pubkey is None:
+                # Incomplete PSBT
+                continue
 
-            derived = derive_silent_payment_outputs(
-                adjusted_share,
-                [
-                    (out.sp_data.scan_key, out.sp_data.spend_key, out.sp_label)
-                    for _, out in outputs_for_scan
-                ],
-            )
-
-            # Validate each output's script against the derived key
-            for pos, (out_idx, out) in enumerate(outputs_for_scan):
-                if out.script_pubkey is None:
-                    # Incomplete PSBT
-                    continue
-
-                expected_script = Script(b"\x51\x20" + derived[pos])
-                if out.script_pubkey.serialize() != expected_script.serialize():
-                    raise SPValidationError(
-                        "Output {}: Script does not match derived "
-                        "silent payment script".format(out_idx)
-                    )
+            if out.script_pubkey.serialize() != derived_scripts[out_idx].serialize():
+                raise SPValidationError(
+                    "Output {}: Script does not match derived "
+                    "silent payment script".format(out_idx)
+                )
 
 
 def validate_bip375_psbt(psbt, skip_output_scripts: bool = False) -> bool:
