@@ -14,11 +14,8 @@ from embit.silent_payments import SilentPaymentsPSBT as PSBT
 from embit.silent_payments.psbt import SPInputScope as InputScope, SPOutputScope as OutputScope
 from embit.silent_payments import SPValidationError, SilentPaymentData
 from embit.silent_payments.validator import BIP375Validator
-from embit.silent_payments.bip352 import compute_ecdh_share
-from embit.silent_payments.ecdh import (
-    compute_dleq_proof,
-    derive_sp_output_scripts,
-)
+from embit.silent_payments.signing import compute_dleq_proof
+from embit.silent_payments.bip352 import compute_ecdh_share, derive_sp_output_scripts
 from embit.script import p2wpkh, p2wsh, Script
 from embit.transaction import TransactionOutput
 

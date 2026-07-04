@@ -27,18 +27,18 @@ from ..psbt import (
 )
 from . import dleq
 from .bip352 import (
-    derive_outputs_for_keys,
-    compute_ecdh_share,
-)
-from .ecdh import (
     all_outpoints,
-    compute_dleq_proof,
-    compute_global_dleq_proof,
+    compute_ecdh_share,
+    derive_outputs_for_keys,
     derive_sp_output_scripts,
     get_eligible_inputs,
     group_sp_outputs_by_scan_key,
-    match_sp_spend_base,
     input_public_key,
+)
+from .signing import (
+    compute_dleq_proof,
+    compute_global_dleq_proof,
+    match_sp_spend_base,
     resolve_input_privkey,
 )
 from .fields import SilentPaymentData, SPFieldError, SPValidationError
@@ -465,8 +465,8 @@ class SilentPaymentsPSBT(PSBT):
         """BIP-375 single-signer Silent Payment send: this signer controls
         every eligible input and acts as its own output generator.
 
-        Uses the same core derivation as create_outputs (verified against
-        BIP-352 test vectors) to compute output scripts and global ECDH
+        Uses the same core derivation as derive_outputs_for_keys (verified
+        against BIP-352 test vectors) to compute output scripts and global ECDH
         shares in one pass, then signs every input.
 
         Raises SPValidationError if an eligible input is not controlled by

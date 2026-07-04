@@ -21,7 +21,7 @@ from embit import bip32, ec
 from embit.silent_payments import dleq
 from embit.psbt import DerivationPath, derive_hdkey
 from embit.silent_payments import SilentPaymentsPSBT as PSBT
-from embit.silent_payments.ecdh import resolve_input_privkey
+from embit.silent_payments.signing import resolve_input_privkey
 from embit.silent_payments.psbt import (
     SPInputScope as InputScope,
     SPOutputScope as OutputScope,

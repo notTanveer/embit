@@ -29,56 +29,32 @@ class DLEQError(Exception):
     """Raised when DLEQ proof generation fails due to invalid inputs."""
 
 
-def _scalar_mult_G(scalar_bytes, G_sec):
-    """Return scalar * G_sec as an opaque pubkey handle.
-
-    Uses ec_pubkey_create for the standard secp256k1 generator (fast path)
-    and parse + tweak_mul for an arbitrary base point.
-    Raises ValueError / OverflowError on invalid inputs.
-    """
-    if G_sec == _G_COMPRESSED:
+def _point_mul(scalar_bytes, base_sec):
+    """scalar * base → opaque pubkey handle. Fast path for secp256k1 generator G."""
+    if base_sec == _G_COMPRESSED:
         return ec_pubkey_create(scalar_bytes)
-    # bytearray: tweak_mul mutates the point in place (required by the pure-Python
-    # secp256k1 backend, which rejects immutable bytes; works with ctypes too)
-    pub = bytearray(ec_pubkey_parse(G_sec))
+    pub = bytearray(ec_pubkey_parse(base_sec))
     ec_pubkey_tweak_mul(pub, scalar_bytes)
     return pub
 
 
-def _mul_point_compressed(point_sec, scalar):
-    """Return scalar * point_sec as compressed bytes.
-
-    Same parse + tweak_mul sequence as _scalar_mult_G's non-fast-path branch,
-    but serializes the result -- for callers that only need the compressed
-    point, never the opaque internal handle (so no G-generator fast path).
-    """
-    point = bytearray(ec_pubkey_parse(point_sec))
-    ec_pubkey_tweak_mul(point, scalar)
-    return ec_pubkey_serialize(point, EC_COMPRESSED)
-
-
-def _mul_point(base_sec, scalar):
-    """Return scalar * base_sec, or None (point at infinity) when scalar == 0.
-
-    Mirrors the BIP-374 reference point_mul, where a zero scalar yields the
-    identity element. The caller passes scalar already reduced to [0, n).
-    """
-    if scalar == 0:
-        return None
-    return _scalar_mult_G(scalar.to_bytes(32, "big"), base_sec)
+def _point_mul_or_inf(base_sec, scalar_int):
+    """scalar * base → handle, or None (point at infinity) when scalar == 0."""
+    return None if scalar_int == 0 else _point_mul(scalar_int.to_bytes(32, "big"), base_sec)
 
 
 def _add_points(p1, p2):
-    """Return p1 + p2, treating None as the point at infinity.
-
-    ec_pubkey_combine raises ValueError when the sum is the point at infinity,
-    which callers convert to a verification failure (spec is_infinite check).
-    """
+    """p1 + p2, treating None as the point at infinity."""
     if p1 is None:
         return p2
     if p2 is None:
         return p1
     return ec_pubkey_combine(p1, p2)
+
+
+def _serialize(pub):
+    """Compress an opaque pubkey handle to 33 bytes."""
+    return ec_pubkey_serialize(pub, EC_COMPRESSED)
 
 
 def generate_dleq_proof(a_bytes, B_sec, r=None, m=None, G=None):
@@ -91,14 +67,9 @@ def generate_dleq_proof(a_bytes, B_sec, r=None, m=None, G=None):
     Args:
         a_bytes: 32-byte private key scalar.
         B_sec:   33-byte compressed pubkey (alternative base point B).
-        r:       32-byte auxiliary randomness. Must be fresh per proof; reusing r
-                 with the same (a, B) and no m can leak a. When m is provided,
-                 it is mixed into nonce generation, so that leak does not occur
-                 if the reused r is paired with different messages, but fresh r
-                 is still required.
+        r:       32-byte auxiliary randomness. Must be fresh per proof.
+        m:       Optional 32-byte message bound during generation.
         G:       Optional 33-byte compressed base point. Defaults to secp256k1 G.
-                 BIP-374 footnote 2 allows any curve point as the generator so
-                 the algorithm can be used with alternate bases on secp256k1.
 
     Returns:
         64-byte proof: bytes(32, e) || bytes(32, s).
@@ -114,72 +85,43 @@ def generate_dleq_proof(a_bytes, B_sec, r=None, m=None, G=None):
         raise DLEQError("m must be exactly 32 bytes per BIP-374")
     if G is not None and len(G) != 33:
         raise DLEQError("G must be a 33-byte compressed pubkey")
+    if r is None or len(r) != 32:
+        raise DLEQError("r must be provided as 32 bytes of fresh auxiliary randomness")
 
     G_sec = _G_COMPRESSED if G is None else G
-
     a_int = int.from_bytes(a_bytes, "big")
     if a_int == 0 or a_int >= SECP256K1_ORDER:
         raise DLEQError("a is out of range [1, n-1]")
 
     try:
-        A_internal = _scalar_mult_G(a_bytes, G_sec)  # A = a*G
+        A_compressed = _serialize(_point_mul(a_bytes, G_sec))
+        C_compressed = _serialize(_point_mul(a_bytes, B_sec))
     except (ValueError, OverflowError):
-        raise DLEQError("Invalid private key or G point")
-    A_compressed = ec_pubkey_serialize(A_internal, EC_COMPRESSED)
+        raise DLEQError("Invalid private key or base point")
 
-    # C = a*B; ec_pubkey_parse rejects the point at infinity (spec is_infinite(B)).
-    try:
-        C_compressed = _mul_point_compressed(B_sec, a_bytes)
-    except (ValueError, OverflowError):
-        raise DLEQError("Invalid B_sec")
-
-    if r is None:
-        raise DLEQError(
-            "r must be provided: pass 32 bytes of fresh auxiliary randomness"
-        )
-    if len(r) != 32:
-        raise DLEQError("r must be 32 bytes")
-
-    aux_hash = hashes.tagged_hash(DLEQ_TAG_AUX, r)
-    t_int = a_int ^ int.from_bytes(aux_hash, "big")
-    t = t_int.to_bytes(32, "big")
-
+    t_int = a_int ^ int.from_bytes(hashes.tagged_hash(DLEQ_TAG_AUX, r), "big")
     m_prime = m if m is not None else b""
 
-    # k = H_nonce(t || cbytes(A) || cbytes(C) || m') mod n
-    rand = hashes.tagged_hash(DLEQ_TAG_NONCE, t + A_compressed + C_compressed + m_prime)
-    k = int.from_bytes(rand, "big") % SECP256K1_ORDER
+    k = int.from_bytes(
+        hashes.tagged_hash(DLEQ_TAG_NONCE, t_int.to_bytes(32, "big") + A_compressed + C_compressed + m_prime),
+        "big",
+    ) % SECP256K1_ORDER
     if k == 0:
         raise DLEQError("Derived nonce k is zero")
 
     k_bytes = k.to_bytes(32, "big")
+    R1_compressed = _serialize(_point_mul(k_bytes, G_sec))
+    R2_compressed = _serialize(_point_mul(k_bytes, B_sec))
 
-    R1_internal = _scalar_mult_G(k_bytes, G_sec)  # R1 = k*G
-    R1_compressed = ec_pubkey_serialize(R1_internal, EC_COMPRESSED)
-
-    R2_compressed = _mul_point_compressed(B_sec, k_bytes)  # R2 = k*B (fresh buffer)
-
-    # e = int(H_challenge(A || B || C || G || R1 || R2 || m'))
-    e_hash = hashes.tagged_hash(
+    e = int.from_bytes(hashes.tagged_hash(
         DLEQ_TAG_CHALLENGE,
-        A_compressed
-        + B_sec
-        + C_compressed
-        + G_sec
-        + R1_compressed
-        + R2_compressed
-        + m_prime,
-    )
-    e = int.from_bytes(e_hash, "big")
-
+        A_compressed + B_sec + C_compressed + G_sec + R1_compressed + R2_compressed + m_prime,
+    ), "big")
     s = (k + e * a_int) % SECP256K1_ORDER
-
     proof = e.to_bytes(32, "big") + s.to_bytes(32, "big")
 
-    # self-verify before returning (as required by spec)
     if not verify_dleq_proof(A_compressed, B_sec, C_compressed, proof, m, G=G):
         raise DLEQError("Self-verification of generated proof failed")
-
     return proof
 
 
@@ -187,17 +129,7 @@ def verify_dleq_proof(A_sec, B_sec, C_sec, proof, m=None, G=None):
     """
     Verify a 64-byte DLEQ proof (BIP-374 VerifyProof).
 
-    Returns True if the proof is valid, False otherwise.
-    Never raises exceptions — all failures return False.
-
-    Args:
-        A_sec:  33-byte compressed pubkey (a*G).
-        B_sec:  33-byte compressed pubkey (alternative base point B).
-        C_sec:  33-byte compressed pubkey (a*B, the ECDH result).
-        proof:  64-byte proof bytes.
-        m:      Optional 32-byte message that was bound during generation.
-        G:      33-byte compressed base point. Defaults to secp256k1 G.
-                Must match the G used during proof generation.
+    Returns True if valid, False otherwise. Never raises.
     """
     if len(proof) != 64:
         return False
@@ -205,46 +137,26 @@ def verify_dleq_proof(A_sec, B_sec, C_sec, proof, m=None, G=None):
         return False
 
     G_sec = _G_COMPRESSED if G is None else G
-
     try:
         e = int.from_bytes(proof[:32], "big")
         s = int.from_bytes(proof[32:], "big")
-
         if s >= SECP256K1_ORDER:
             return False
 
         neg_e = (-e) % SECP256K1_ORDER
-
         m_prime = m if m is not None else b""
 
-        # ec_pubkey_parse rejects the point at infinity (spec is_infinite checks
-        # for A, B, C). A zero scalar (s or -e) yields the point at infinity, which
-        # _mul_point/_add_points carry through as None, matching the reference's
-        # point_mul/point_add instead of bailing out early. R1/R2 being the point
-        # at infinity (None, or a ValueError from ec_pubkey_combine) is a failure.
-
-        # R1 = s*G + (-e)*A
-        R1_internal = _add_points(_mul_point(G_sec, s), _mul_point(A_sec, neg_e))
-        if R1_internal is None:
+        R1 = _add_points(_point_mul_or_inf(G_sec, s), _point_mul_or_inf(A_sec, neg_e))
+        if R1 is None:
             return False
-        R1_compressed = ec_pubkey_serialize(R1_internal, EC_COMPRESSED)
-
-        # R2 = s*B + (-e)*C
-        R2_internal = _add_points(_mul_point(B_sec, s), _mul_point(C_sec, neg_e))
-        if R2_internal is None:
+        R2 = _add_points(_point_mul_or_inf(B_sec, s), _point_mul_or_inf(C_sec, neg_e))
+        if R2 is None:
             return False
-        R2_compressed = ec_pubkey_serialize(R2_internal, EC_COMPRESSED)
 
-        # Recompute e' = int(H_challenge(A || B || C || G || R1 || R2 || m'))
-        e_check = int.from_bytes(
-            hashes.tagged_hash(
-                DLEQ_TAG_CHALLENGE,
-                A_sec + B_sec + C_sec + G_sec + R1_compressed + R2_compressed + m_prime,
-            ),
-            "big",
-        )
-
+        e_check = int.from_bytes(hashes.tagged_hash(
+            DLEQ_TAG_CHALLENGE,
+            A_sec + B_sec + C_sec + G_sec + _serialize(R1) + _serialize(R2) + m_prime,
+        ), "big")
         return e == e_check
-
     except (ValueError, OverflowError):
         return False
