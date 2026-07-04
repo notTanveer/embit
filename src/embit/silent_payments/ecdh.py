@@ -576,6 +576,14 @@ def _derive_outputs_for_keys(priv_keys, outpoints, scan_spend_groups):
         (a_sum_bytes, {scan_key_bytes: (ecdh_share, {k: xonly_bytes})})
         or None if a_sum == 0
     """
+    for _scan_key, spend_keys in scan_spend_groups.values():
+        if len(spend_keys) > K_MAX:
+            raise ValueError(
+                "Too many outputs for one scan key: {} > {}".format(
+                    len(spend_keys), K_MAX
+                )
+            )
+
     a_sum = _sum_privkeys(priv_keys)
     if a_sum == 0:
         return None
@@ -632,14 +640,6 @@ def create_outputs(input_privkeys, outpoints, recipients):
             addr_lists[sk_bytes] = []
         scan_spend_groups[sk_bytes][1].append(B_spend)
         addr_lists[sk_bytes].append(addr)
-
-    for sk_bytes, (_, spend_keys) in scan_spend_groups.items():
-        if len(spend_keys) > K_MAX:
-            raise ValueError(
-                "Too many outputs for one scan key: {} > {}".format(
-                    len(spend_keys), K_MAX
-                )
-            )
 
     derivation = _derive_outputs_for_keys(normalized, outpoints, scan_spend_groups)
     if derivation is None:
