@@ -12,7 +12,8 @@ from collections import OrderedDict
 
 from .. import ec
 from ..base import EmbitError
-from ..script import Witness
+from ..script import Script, Witness
+from ..transaction import COutPoint
 from ..psbt import (
     PSBT,
     DerivationPath,
@@ -27,6 +28,7 @@ from ..psbt import (
 )
 from . import dleq
 from .ecdh import (
+    _derive_outputs_for_keys,
     compute_ecdh_share,
     compute_dleq_proof,
     compute_global_ecdh_share,
@@ -462,25 +464,28 @@ class SilentPaymentsPSBT(PSBT):
         """BIP-375 single-signer Silent Payment send: this signer controls
         every eligible input and acts as its own output generator.
 
-        Runs the full orchestration a single-party signer needs: clear any
-        stale SP fields, compute per-input ECDH shares, derive and fill the
-        SP output scripts those shares unlock, replace the per-input shares
-        with the smaller BIP-375 global share/proof pair (a signer covering
-        all inputs SHOULD prefer the global fields), then sign every input.
+        Uses the same core derivation as create_outputs (verified against
+        BIP-352 test vectors) to compute output scripts and global ECDH
+        shares in one pass, then signs every input.
 
         Raises SPValidationError if an eligible input is not controlled by
         ``root`` (multi-party Silent Payment sends are out of scope for a
-        stateless single-party signer), if no eligible input matches ``root``
-        at all, or if the SP output scripts cannot be resolved even though
-        this signer controls every eligible input.
+        stateless single-party signer), or if no eligible input matches
+        ``root`` at all.
         """
         if not (self.version == 2 and self.has_sp_outputs):
             return self.sign_with(root)
 
-        scan_key_objects = {}
-        for out in self.outputs:
+        scan_spend_groups = {}
+        output_indices = {}
+        for i, out in enumerate(self.outputs):
             if out.sp_data is not None:
-                scan_key_objects[out.sp_data.scan_key.sec()] = out.sp_data.scan_key
+                sk_bytes = out.sp_data.scan_key.sec()
+                if sk_bytes not in scan_spend_groups:
+                    scan_spend_groups[sk_bytes] = (out.sp_data.scan_key, [])
+                    output_indices[sk_bytes] = []
+                scan_spend_groups[sk_bytes][1].append(out.sp_data.spend_key)
+                output_indices[sk_bytes].append(i)
 
         eligible = get_eligible_inputs(self.inputs, has_sp_outputs=True)
         if not eligible:
@@ -519,27 +524,32 @@ class SilentPaymentsPSBT(PSBT):
             inp.sp_ecdh_shares.clear()
             inp.sp_dleq_proofs.clear()
 
-        self._sign_with_sp(root, aux_rand=aux_rand)
+        outpoints = [
+            COutPoint(txid=self.tx.vin[i].txid, out_idx=self.tx.vin[i].vout)
+            for i in range(len(self.inputs))
+        ]
 
-        if not self.fill_output_scripts(eligible=eligible):
+        derivation = _derive_outputs_for_keys(
+            priv_keys, outpoints, scan_spend_groups
+        )
+        if derivation is None:
             raise SPValidationError(
-                "Silent Payment signing failed: could not derive output "
-                "scripts; an eligible input's public key is unrecoverable "
-                "(missing PSBT_IN_BIP32_DERIVATION / PSBT_IN_PARTIAL_SIG)."
+                "Silent Payment signing failed: private key sum is zero."
             )
 
-        for sk_bytes, scan_key in scan_key_objects.items():
-            global_share = compute_global_ecdh_share(priv_keys, scan_key)
-            if global_share is None:
-                continue
-            self.sp_ecdh_shares[sk_bytes] = global_share
-            # verify=False: global_share was just derived using priv and scan keys
+        a_sum_bytes, results = derivation
+
+        for sk_bytes, (ecdh_share, outputs) in results.items():
+            self.sp_ecdh_shares[sk_bytes] = ecdh_share
+            scan_key = scan_spend_groups[sk_bytes][0]
             self.sp_dleq_proofs[sk_bytes] = compute_global_dleq_proof(
-                priv_keys, scan_key, global_share, aux_rand=aux_rand, verify=False
+                priv_keys, scan_key, ecdh_share,
+                aux_rand=aux_rand, verify=False, _a_sum_bytes=a_sum_bytes,
             )
-            for inp in self.inputs:
-                inp.sp_ecdh_shares.pop(sk_bytes, None)
-                inp.sp_dleq_proofs.pop(sk_bytes, None)
+            for pos, out_idx in enumerate(output_indices[sk_bytes]):
+                self.outputs[out_idx].script_pubkey = Script(
+                    b"\x51\x20" + outputs[pos]
+                )
 
         return self.sign_with(root, with_sp_shares=False)
 

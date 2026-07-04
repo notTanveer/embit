@@ -209,10 +209,11 @@ class TestFillOutputScripts(unittest.TestCase):
         self.assertFalse(psbt.fill_output_scripts(eligible=[0, 1]))
         self.assertIsNone(psbt.outputs[0].script_pubkey)
 
-    def test_raises_when_controlled_input_pubkey_unrecoverable(self):
-        """A raw-key input this signer controls (matched by key hash) but whose
-        pubkey can't be recovered (no PSBT_IN_BIP32_DERIVATION / partial_sig)
-        must raise with a reason, not return a bare 0."""
+    def test_succeeds_when_controlled_input_pubkey_not_in_psbt_metadata(self):
+        """A raw-key input whose pubkey is absent from PSBT metadata
+        (no PSBT_IN_BIP32_DERIVATION / partial_sig) still succeeds because
+        sign_single_party derives outputs directly from private keys, not
+        from recovered PSBT pubkeys."""
         raw = ec.PrivateKey(b"\x03" * 32)
         scan_pub, spend_pub = _sp_keys()
         pub = raw.get_public_key()
@@ -225,15 +226,16 @@ class TestFillOutputScripts(unittest.TestCase):
         inp.witness_utxo = TransactionOutput(
             value=100_000, script_pubkey=p2wpkh(pub)
         )
-        psbt.add_input(inp)  # no bip32_derivations: pubkey is unrecoverable
+        psbt.add_input(inp)
         out = OutputScope()
         out.value = 95_000
         out.sp_data = SilentPaymentData(scan_pub, spend_pub)
         psbt.add_output(out)
         psbt.tx_modifiable_flags = 0
 
-        with self.assertRaisesRegex(SPValidationError, "unrecoverable"):
-            psbt.sign_single_party(raw)
+        sigs = psbt.sign_single_party(raw)
+        self.assertGreater(sigs, 0)
+        self.assertIsNotNone(psbt.outputs[0].script_pubkey)
 
     def test_no_sp_outputs_is_a_noop_success(self):
         root = _root()

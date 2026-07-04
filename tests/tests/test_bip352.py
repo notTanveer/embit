@@ -8,6 +8,7 @@ from unittest import TestCase
 
 import pytest
 from embit.silent_payments import bip352
+from embit.silent_payments.ecdh import create_outputs
 from embit.ec import PrivateKey
 import os
 import json
@@ -216,7 +217,7 @@ class BIP352Test(TestCase):
                     is_xonly = spk.script_type() == "p2tr"
                     input_privkeys.append((unhexlify(txin["private_key"]), is_xonly))
 
-                outputs_map = bip352.create_outputs(
+                outputs_map = create_outputs(
                     input_privkeys=input_privkeys,
                     outpoints=outpoints,
                     recipients=given["recipients"],
@@ -244,7 +245,7 @@ class BIP352Test(TestCase):
         recipients = [vector["sp_address"]] * (bip352.K_MAX + 1)
 
         with pytest.raises(ValueError, match="Too many outputs"):
-            bip352.create_outputs(input_privkeys, outpoints, recipients)
+            create_outputs(input_privkeys, outpoints, recipients)
 
     def test_derive_outputs_rejects_too_many_outputs_per_scan_key(self):
         """Should fail when the per-scan-key recipient list exceeds K_MAX"""
@@ -273,11 +274,11 @@ class BIP352Test(TestCase):
 
         # The shared secret depends only on (inputs, outpoints, scan key), so
         # single-address runs yield the per-k outputs to compare against.
-        out_x = bip352.create_outputs(input_privkeys, outpoints, [addr_x] * 3)[addr_x]
-        out_y = bip352.create_outputs(input_privkeys, outpoints, [addr_y] * 3)[addr_y]
+        out_x = create_outputs(input_privkeys, outpoints, [addr_x] * 3)[addr_x]
+        out_y = create_outputs(input_privkeys, outpoints, [addr_y] * 3)[addr_y]
 
         # Interleaved vout order [X, Y, X] -> k = 0, 1, 2.
-        result = bip352.create_outputs(
+        result = create_outputs(
             input_privkeys, outpoints, [addr_x, addr_y, addr_x]
         )
 

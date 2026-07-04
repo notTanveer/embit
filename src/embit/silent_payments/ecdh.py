@@ -9,13 +9,21 @@ from ..misc import urandom
 from ..script import Script
 from ..transaction import COutPoint
 from . import dleq
-from .bip352 import get_input_hash, derive_silent_payment_outputs
+from binascii import hexlify
+from .bip352 import (
+    get_input_hash,
+    derive_silent_payment_outputs,
+    decode_silent_payment_address,
+    K_MAX,
+)
 from ..util.key import SECP256K1_ORDER
 from ..util.secp256k1 import (
     ec_pubkey_combine,
+    ec_pubkey_create,
     ec_pubkey_parse,
     ec_pubkey_serialize,
     ec_pubkey_tweak_mul,
+    ec_privkey_negate,
     EC_COMPRESSED,
     ec_seckey_verify,
 )
@@ -38,6 +46,26 @@ def _default_aux_rand(*secret_material: bytes) -> bytes:
     aux_rand bypass this entirely and are unaffected.
     """
     return tagged_hash("embit/DLEQDefaultAuxRand", urandom(32) + b"".join(secret_material))
+
+
+def _sum_privkeys(private_keys):
+    return sum(int.from_bytes(priv, "big") for priv in private_keys) % SECP256K1_ORDER
+
+
+def _normalize_xonly_keys(input_privkeys):
+    """Normalize (secret, is_xonly) pairs: negate odd-Y xonly keys.
+    Returns list of 32-byte private key scalars ready for summation."""
+    normalized = []
+    for sec, is_xonly in input_privkeys:
+        if not ec_seckey_verify(sec):
+            raise ValueError("Invalid private key")
+        if is_xonly:
+            pub = ec_pubkey_create(sec)
+            ser = ec_pubkey_serialize(pub)
+            if ser[0] == 0x03:
+                sec = ec_privkey_negate(sec)
+        normalized.append(sec)
+    return normalized
 
 
 def compute_ecdh_share(private_key: bytes, scan_key: ec.PublicKey) -> bytes:
@@ -74,19 +102,15 @@ def compute_global_ecdh_share(private_keys, scan_key: ec.PublicKey):
     if not private_keys:
         return None
 
-    # Verify all private keys
     for priv in private_keys:
         if not ec_seckey_verify(priv):
             raise SPFieldError("Invalid private key")
 
-    # Sum all private keys mod n
-    a_sum = sum(int.from_bytes(priv, "big") for priv in private_keys) % SECP256K1_ORDER
+    a_sum = _sum_privkeys(private_keys)
     if a_sum == 0:
         return None
 
     a_sum_bytes = a_sum.to_bytes(32, "big")
-
-    # Compute a_sum·B_scan
     b_internal = bytearray(ec_pubkey_parse(scan_key.sec()))
     ec_pubkey_tweak_mul(b_internal, a_sum_bytes)
     return ec_pubkey_serialize(b_internal, EC_COMPRESSED)
@@ -137,6 +161,7 @@ def compute_global_dleq_proof(
     global_share: bytes,
     aux_rand=None,
     verify: bool = True,
+    _a_sum_bytes=None,
 ) -> bytes:
     """
     Generate DLEQ proof for global ECDH share.
@@ -153,15 +178,19 @@ def compute_global_dleq_proof(
                 before proving. Defaults to True; a trusted internal caller
                 that just derived `global_share` via compute_global_ecdh_share
                 passes False to avoid the duplicate scalar multiplication.
+        _a_sum_bytes: Precomputed 32-byte summed private key scalar. When
+                      provided, skips re-summation of `private_keys`.
 
     Returns:
         64-byte DLEQ proof
     """
-    # Sum all private keys mod n
-    a_sum = sum(int.from_bytes(priv, "big") for priv in private_keys) % SECP256K1_ORDER
-    if a_sum == 0:
-        raise SPFieldError("Cannot generate proof for zero sum")
-    a_sum_bytes = a_sum.to_bytes(32, "big")
+    if _a_sum_bytes is not None:
+        a_sum_bytes = _a_sum_bytes
+    else:
+        a_sum = _sum_privkeys(private_keys)
+        if a_sum == 0:
+            raise SPFieldError("Cannot generate proof for zero sum")
+        a_sum_bytes = a_sum.to_bytes(32, "big")
 
     if verify:
         # Verify global_share against the already-summed a_sum instead of
@@ -429,7 +458,13 @@ def sum_pubkeys(pubkeys) -> bytes:
     return ec_pubkey_serialize(acc, EC_COMPRESSED)
 
 
-def derive_sp_output_scripts(psbt, eligible=None) -> dict:
+def _apply_input_hash(ecdh_share, input_hash):
+    adjusted = bytearray(ec_pubkey_parse(ecdh_share))
+    ec_pubkey_tweak_mul(adjusted, input_hash)
+    return ec_pubkey_serialize(adjusted, EC_COMPRESSED)
+
+
+def derive_sp_output_scripts(psbt, eligible=None, eligible_pubkeys=None) -> dict:
     """
     Derive the taproot scriptPubKey for every SP output whose ECDH share is
     already resolvable: a PSBT-global share for its scan key, or per-input
@@ -459,7 +494,8 @@ def derive_sp_output_scripts(psbt, eligible=None) -> dict:
     if eligible is None:
         eligible = get_eligible_inputs(psbt.inputs, has_sp_outputs=True)
 
-    eligible_pubkeys = [input_public_key(psbt.inputs[i]) for i in eligible]
+    if eligible_pubkeys is None:
+        eligible_pubkeys = [input_public_key(psbt.inputs[i]) for i in eligible]
     if not eligible_pubkeys or any(pk is None for pk in eligible_pubkeys):
         # A partial A_sum (silently dropping unrecoverable keys) would derive
         # wrong scripts, not just incomplete ones - refuse outright instead.
@@ -501,10 +537,7 @@ def derive_sp_output_scripts(psbt, eligible=None) -> dict:
                 continue
             ecdh_share = ec_pubkey_serialize(share_sum, EC_COMPRESSED)
 
-        # Apply input_hash: adjusted_share = input_hash . ecdh_share (BIP-352)
-        adjusted = bytearray(ec_pubkey_parse(ecdh_share))
-        ec_pubkey_tweak_mul(adjusted, input_hash)
-        adjusted_share = ec_pubkey_serialize(adjusted, EC_COMPRESSED)
+        adjusted_share = _apply_input_hash(ecdh_share, input_hash)
 
         derived = derive_silent_payment_outputs(
             adjusted_share,
@@ -514,3 +547,98 @@ def derive_sp_output_scripts(psbt, eligible=None) -> dict:
             resolved[out_idx] = Script(b"\x51\x20" + derived[pos])
 
     return resolved
+
+
+def _derive_outputs_for_keys(priv_keys, outpoints, scan_spend_groups):
+    """Core output derivation from private keys.
+
+    Computes ECDH shares and derives output pubkeys for each scan-key group.
+    Used by both create_outputs (address API) and sign_single_party (PSBT API)
+    so both paths run the same derivation verified against BIP-352 test vectors.
+
+    Args:
+        priv_keys: list of 32-byte private key scalars (parity-normalized)
+        outpoints: list of COutPoint
+        scan_spend_groups: {scan_key_bytes: (scan_key, [spend_key, ...])}
+
+    Returns:
+        (a_sum_bytes, {scan_key_bytes: (ecdh_share, {k: xonly_bytes})})
+        or None if a_sum == 0
+    """
+    a_sum = _sum_privkeys(priv_keys)
+    if a_sum == 0:
+        return None
+    a_sum_bytes = a_sum.to_bytes(32, "big")
+
+    A_sum_bytes = ec_pubkey_serialize(ec_pubkey_create(a_sum_bytes))
+    input_hash = get_input_hash(outpoints, A_sum_bytes)
+
+    results = {}
+    for sk_bytes, (scan_key, spend_keys) in scan_spend_groups.items():
+        ecdh_share = compute_ecdh_share(a_sum_bytes, scan_key)
+        adjusted_share = _apply_input_hash(ecdh_share, input_hash)
+        outputs = derive_silent_payment_outputs(adjusted_share, spend_keys)
+        results[sk_bytes] = (ecdh_share, outputs)
+
+    return a_sum_bytes, results
+
+
+def create_outputs(input_privkeys, outpoints, recipients):
+    """
+    Creates silent payment outputs for given recipients.
+
+    Args:
+        input_privkeys: List of (private_key_bytes, is_xonly) tuples
+        outpoints: List of transaction outpoints
+        recipients: List of silent payment addresses (strings) - duplicates
+            allowed; pass in vout order so k matches the BIP-375 validator.
+
+    Returns:
+        Dictionary mapping each unique recipient address to list of output hex
+        strings. A repeated address's outputs are listed in occurrence order, so
+        to rebuild the transaction in vout order, walk ``recipients`` and pop the
+        next output from ``result[addr]`` (FIFO) for each entry. The k baked into
+        each output assumes that ordering; flattening the dict by address instead
+        would place outputs at the wrong vouts.
+    """
+    if not input_privkeys:
+        return {}
+
+    normalized = _normalize_xonly_keys(input_privkeys)
+
+    decoded = {}
+    for addr in recipients:
+        if addr not in decoded:
+            decoded[addr] = decode_silent_payment_address(addr)
+
+    scan_spend_groups = {}
+    addr_lists = {}
+    for addr in recipients:
+        B_scan, B_spend = decoded[addr]
+        sk_bytes = B_scan.sec()
+        if sk_bytes not in scan_spend_groups:
+            scan_spend_groups[sk_bytes] = (B_scan, [])
+            addr_lists[sk_bytes] = []
+        scan_spend_groups[sk_bytes][1].append(B_spend)
+        addr_lists[sk_bytes].append(addr)
+
+    for sk_bytes, (_, spend_keys) in scan_spend_groups.items():
+        if len(spend_keys) > K_MAX:
+            raise ValueError(
+                "Too many outputs for one scan key: {} > {}".format(
+                    len(spend_keys), K_MAX
+                )
+            )
+
+    derivation = _derive_outputs_for_keys(normalized, outpoints, scan_spend_groups)
+    if derivation is None:
+        return {}
+
+    _a_sum_bytes, results = derivation
+
+    output = {addr: [] for addr in decoded}
+    for sk_bytes, (_ecdh_share, outputs) in results.items():
+        for k, addr in enumerate(addr_lists[sk_bytes]):
+            output[addr].append(hexlify(outputs[k]).decode())
+
+    return output

@@ -60,7 +60,10 @@ class BIP375Validator:
         # Stage 2: ECDH Coverage
         try:
             eligible_inputs = get_eligible_inputs(self.psbt.inputs, has_sp_outputs=True)
-            self._validate_ecdh_coverage(eligible_inputs)
+            eligible_pubkeys = [
+                input_public_key(self.psbt.inputs[i]) for i in eligible_inputs
+            ]
+            self._validate_ecdh_coverage(eligible_inputs, eligible_pubkeys)
         except SPValidationError as e:
             raise SPValidationError("ECDH coverage validation failed: {}".format(e))
 
@@ -73,7 +76,7 @@ class BIP375Validator:
         # Stage 4: Output Scripts (optional)
         if not skip_output_scripts:
             try:
-                self._validate_output_scripts(eligible_inputs)
+                self._validate_output_scripts(eligible_inputs, eligible_pubkeys)
             except SPValidationError as e:
                 raise SPValidationError("Output script validation failed: {}".format(e))
 
@@ -122,7 +125,7 @@ class BIP375Validator:
                             "PSBT_OUT_SCRIPT is set for SP output".format(i)
                         )
 
-    def _validate_ecdh_coverage(self, eligible_inputs):
+    def _validate_ecdh_coverage(self, eligible_inputs, eligible_pubkeys):
         """
         Stage 2: ECDH Coverage validation.
 
@@ -160,7 +163,7 @@ class BIP375Validator:
                     # Can't verify without script (incomplete PSBT)
                     continue
 
-                self._verify_global_dleq_proof(scan_key_bytes, out_idx, eligible_inputs)
+                self._verify_global_dleq_proof(scan_key_bytes, out_idx, eligible_pubkeys)
             else:
                 # Check per-input ECDH shares
                 for inp_idx in eligible_inputs:
@@ -203,27 +206,20 @@ class BIP375Validator:
                             )
 
     def _verify_global_dleq_proof(
-        self, scan_key_bytes: bytes, out_idx: int, eligible_inputs
+        self, scan_key_bytes: bytes, out_idx: int, eligible_pubkeys
     ):
         """Verify a global DLEQ proof."""
         scan_key = ec.PublicKey.parse(scan_key_bytes)
         proof_bytes = self.psbt.sp_dleq_proofs[scan_key_bytes]
 
-        # Reconstruct sum of eligible input public keys
-        eligible_pubkeys = []
-        for inp_idx in eligible_inputs:
-            inp = self.psbt.inputs[inp_idx]
-            pubkey = input_public_key(inp)
-            if pubkey:
-                eligible_pubkeys.append(pubkey)
-
-        if not eligible_pubkeys:
+        pubkeys = [pk for pk in eligible_pubkeys if pk is not None]
+        if not pubkeys:
             raise SPValidationError(
                 "Output {}: Cannot verify global DLEQ - no eligible inputs "
                 "with public keys".format(out_idx)
             )
 
-        A_sum_bytes = sum_pubkeys(eligible_pubkeys)
+        A_sum_bytes = sum_pubkeys(pubkeys)
 
         # Get ECDH share as public key
         ecdh_share = self.psbt.sp_ecdh_shares[scan_key_bytes]
@@ -290,7 +286,7 @@ class BIP375Validator:
                         )
                     )
 
-    def _validate_output_scripts(self, eligible_inputs):
+    def _validate_output_scripts(self, eligible_inputs, eligible_pubkeys):
         """
         Stage 4: Output Scripts validation.
 
@@ -298,16 +294,15 @@ class BIP375Validator:
         - Verify script is correctly derived from SP data and ECDH shares
         - Verify sorting of outputs by scan/spend keys
         """
-        eligible_pubkeys = [
-            input_public_key(self.psbt.inputs[i]) for i in eligible_inputs
-        ]
-        eligible_pubkeys = [pk for pk in eligible_pubkeys if pk is not None]
-        if not eligible_pubkeys:
+        pubkeys = [pk for pk in eligible_pubkeys if pk is not None]
+        if not pubkeys:
             raise SPValidationError(
                 "Cannot validate output scripts: no eligible input public keys found"
             )
 
-        derived_scripts = derive_sp_output_scripts(self.psbt, eligible=eligible_inputs)
+        derived_scripts = derive_sp_output_scripts(
+            self.psbt, eligible=eligible_inputs, eligible_pubkeys=eligible_pubkeys
+        )
 
         for out_idx, out in enumerate(self.psbt.outputs):
             if out.sp_data is None:

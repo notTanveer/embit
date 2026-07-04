@@ -6,18 +6,12 @@ see: https://github.com/bitcoin/bips/blob/master/bip-0352.mediawiki
 from .. import bech32, ec
 from ..util import secp256k1
 from ..hashes import tagged_hash
-from ..util.key import SECP256K1_ORDER
 from ..util.secp256k1 import (
-    ec_pubkey_create,
     ec_pubkey_serialize,
     ec_pubkey_parse,
-    ec_pubkey_tweak_mul,
     ec_pubkey_tweak_add,
-    ec_seckey_verify,
-    ec_privkey_negate,
     EC_COMPRESSED,
 )
-from binascii import hexlify
 
 K_MAX = 2323
 
@@ -135,85 +129,6 @@ def get_input_hash(outpoints, sum_pubkey_bytes: bytes) -> bytes:
     lowest_outpoint = sorted(outpoints, key=lambda o: o.serialize())[0]
     preimage = lowest_outpoint.serialize() + sum_pubkey_bytes
     return tagged_hash("BIP0352/Inputs", preimage)
-
-
-def create_outputs(input_privkeys, outpoints, recipients):
-    """
-    Creates silent payment outputs for given recipients.
-
-    Args:
-        input_privkeys: List of (private_key_bytes, is_xonly) tuples
-        outpoints: List of transaction outpoints
-        recipients: List of silent payment addresses (strings) - duplicates
-            allowed; pass in vout order so k matches the BIP-375 validator.
-
-    Returns:
-        Dictionary mapping each unique recipient address to list of output hex
-        strings. A repeated address's outputs are listed in occurrence order, so
-        to rebuild the transaction in vout order, walk ``recipients`` and pop the
-        next output from ``result[addr]`` (FIFO) for each entry. The k baked into
-        each output assumes that ordering; flattening the dict by address instead
-        would place outputs at the wrong vouts.
-    """
-    if not input_privkeys:
-        return {}
-
-    a_sum = 0
-    for sec, is_xonly in input_privkeys:
-        if not ec_seckey_verify(sec):
-            raise ValueError("Invalid private key")
-        if is_xonly:
-            pub = ec_pubkey_create(sec)
-            ser = ec_pubkey_serialize(pub)
-            if ser[0] == 0x03:
-                sec = ec_privkey_negate(sec)
-        a_sum = (a_sum + int.from_bytes(sec, "big")) % SECP256K1_ORDER
-
-    if a_sum == 0:
-        return {}
-
-    a_sum_bytes = a_sum.to_bytes(32, "big")
-    A = ec_pubkey_create(a_sum_bytes)
-
-    input_hash = get_input_hash(outpoints, ec_pubkey_serialize(A))
-
-    # Decode each unique address once; iterate occurrences to assign k in list order.
-    decoded = {}
-    for addr in recipients:
-        if addr not in decoded:
-            decoded[addr] = decode_silent_payment_address(addr)
-
-    groups = {}
-    for addr in recipients:
-        B_scan, B_spend = decoded[addr]
-        groups.setdefault(B_scan, []).append((B_spend, addr))
-
-    for group in groups.values():
-        if len(group) > K_MAX:
-            raise ValueError(
-                "Too many outputs for one scan key: {} > {}".format(
-                    len(group), K_MAX
-                )
-            )
-
-    result = {addr: [] for addr in decoded}
-    scalar = (int.from_bytes(input_hash, "big") * a_sum) % SECP256K1_ORDER
-    scalar_bytes = scalar.to_bytes(32, "big")
-
-    for B_scan, B_spend_list in groups.items():
-        # bytearray: tweak_* mutate the point in place (required by the pure-Python
-        # secp256k1 backend, and works with the ctypes one too)
-        ecdh_point = bytearray(ec_pubkey_parse(B_scan.sec()))
-        ec_pubkey_tweak_mul(ecdh_point, scalar_bytes)
-        shared_secret = ec_pubkey_serialize(ecdh_point)
-
-        outputs = derive_silent_payment_outputs(
-            shared_secret, [B_spend for B_spend, _addr in B_spend_list]
-        )
-        for k, (_B_spend, addr) in enumerate(B_spend_list):
-            result[addr].append(hexlify(outputs[k]).decode())
-
-    return result
 
 
 def derive_silent_payment_outputs(ecdh_share, spend_keys):

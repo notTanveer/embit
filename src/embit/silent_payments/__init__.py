@@ -12,7 +12,7 @@ from .ecdh import (
     compute_global_dleq_proof,
     get_eligible_inputs,
 )
-from .bip352 import create_outputs
+from .ecdh import create_outputs
 from .validator import BIP375Validator, validate_bip375_psbt
 from .psbt import (
     SPInputScope,
