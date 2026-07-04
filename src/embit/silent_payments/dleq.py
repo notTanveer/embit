@@ -45,6 +45,18 @@ def _scalar_mult_G(scalar_bytes, G_sec):
     return pub
 
 
+def _mul_point_compressed(point_sec, scalar):
+    """Return scalar * point_sec as compressed bytes.
+
+    Same parse + tweak_mul sequence as _scalar_mult_G's non-fast-path branch,
+    but serializes the result -- for callers that only need the compressed
+    point, never the opaque internal handle (so no G-generator fast path).
+    """
+    point = bytearray(ec_pubkey_parse(point_sec))
+    ec_pubkey_tweak_mul(point, scalar)
+    return ec_pubkey_serialize(point, EC_COMPRESSED)
+
+
 def _mul_point(base_sec, scalar):
     """Return scalar * base_sec, or None (point at infinity) when scalar == 0.
 
@@ -117,11 +129,9 @@ def generate_dleq_proof(a_bytes, B_sec, r=None, m=None, G=None):
 
     # C = a*B; ec_pubkey_parse rejects the point at infinity (spec is_infinite(B)).
     try:
-        C_internal = bytearray(ec_pubkey_parse(B_sec))
-        ec_pubkey_tweak_mul(C_internal, a_bytes)
+        C_compressed = _mul_point_compressed(B_sec, a_bytes)
     except (ValueError, OverflowError):
         raise DLEQError("Invalid B_sec")
-    C_compressed = ec_pubkey_serialize(C_internal, EC_COMPRESSED)
 
     if r is None:
         raise DLEQError(
@@ -147,9 +157,7 @@ def generate_dleq_proof(a_bytes, B_sec, r=None, m=None, G=None):
     R1_internal = _scalar_mult_G(k_bytes, G_sec)  # R1 = k*G
     R1_compressed = ec_pubkey_serialize(R1_internal, EC_COMPRESSED)
 
-    R2_internal = bytearray(ec_pubkey_parse(B_sec))  # R2 = k*B (fresh buffer)
-    ec_pubkey_tweak_mul(R2_internal, k_bytes)
-    R2_compressed = ec_pubkey_serialize(R2_internal, EC_COMPRESSED)
+    R2_compressed = _mul_point_compressed(B_sec, k_bytes)  # R2 = k*B (fresh buffer)
 
     # e = int(H_challenge(A || B || C || G || R1 || R2 || m'))
     e_hash = hashes.tagged_hash(

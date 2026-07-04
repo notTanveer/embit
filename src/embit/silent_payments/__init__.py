@@ -1,3 +1,5 @@
+"""Silent Payments (BIP-352/374/375/376): addresses, ECDH shares, DLEQ proofs, and PSBT support."""
+
 from . import bip352
 from . import dleq
 from .fields import (
@@ -5,14 +7,17 @@ from .fields import (
     SPValidationError,
     SilentPaymentData,
 )
-from .ecdh import (
+from .bip352 import (
     compute_ecdh_share,
     compute_global_ecdh_share,
+    derive_outputs_for_keys,
+    normalize_xonly_keys,
+)
+from .ecdh import (
     compute_dleq_proof,
     compute_global_dleq_proof,
     get_eligible_inputs,
 )
-from .ecdh import create_outputs
 from .validator import BIP375Validator, validate_bip375_psbt
 from .psbt import (
     SPInputScope,
@@ -32,7 +37,8 @@ __all__ = [
     "compute_dleq_proof",
     "compute_global_dleq_proof",
     "get_eligible_inputs",
-    "create_outputs",
+    "derive_outputs_for_keys",
+    "normalize_xonly_keys",
     "BIP375Validator",
     "validate_bip375_psbt",
     "SPInputScope",

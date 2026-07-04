@@ -26,10 +26,12 @@ from ..psbt import (
     ser_string,
 )
 from . import dleq
-from .ecdh import (
-    _derive_outputs_for_keys,
-    all_outpoints,
+from .bip352 import (
+    derive_outputs_for_keys,
     compute_ecdh_share,
+)
+from .ecdh import (
+    all_outpoints,
     compute_dleq_proof,
     compute_global_dleq_proof,
     derive_sp_output_scripts,
@@ -521,7 +523,7 @@ class SilentPaymentsPSBT(PSBT):
 
         outpoints = all_outpoints(self)
 
-        derivation = _derive_outputs_for_keys(
+        derivation = derive_outputs_for_keys(
             priv_keys, outpoints, scan_spend_groups
         )
         if derivation is None:

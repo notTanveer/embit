@@ -6,23 +6,111 @@ see: https://github.com/bitcoin/bips/blob/master/bip-0352.mediawiki
 from .. import bech32, ec
 from ..util import secp256k1
 from ..hashes import tagged_hash
+from ..util.key import SECP256K1_ORDER
 from ..util.secp256k1 import (
     ec_pubkey_serialize,
     ec_pubkey_parse,
     ec_pubkey_tweak_add,
+    ec_privkey_negate,
+    ec_pubkey_combine,
+    ec_pubkey_create,
+    ec_pubkey_tweak_mul,
+    ec_seckey_verify,
     EC_COMPRESSED,
 )
+from .fields import SPFieldError
 
 K_MAX = 2323
 
+# ============================================================================
+# Crypto Math Utilities
+# ============================================================================
 
-def apply_label(spend_pubkey: ec.PublicKey, scan_privkey: ec.PrivateKey, m: int) -> ec.PublicKey:
+def _sum_privkeys(private_keys):
+    """Sum private key scalars mod SECP256K1_ORDER (BIP-352 a_sum)."""
+    return sum(int.from_bytes(priv, "big") for priv in private_keys) % SECP256K1_ORDER
+
+def normalize_xonly_keys(input_privkeys):
+    """
+    Normalize (secret, is_xonly) pairs: negate odd-Y xonly keys.
+    Returns list of 32-byte private key scalars ready for summation.
+    """
+    normalized = []
+    for sec, is_xonly in input_privkeys:
+        if not ec_seckey_verify(sec):
+            raise ValueError("Invalid private key")
+        if is_xonly:
+            pub = ec_pubkey_create(sec)
+            ser = ec_pubkey_serialize(pub)
+            if ser[0] == 0x03:
+                sec = ec_privkey_negate(sec)
+        normalized.append(sec)
+    return normalized
+
+def _tweak_mul(point_sec, scalar):
+    """Multiply a compressed point by a scalar, returning the compressed result."""
+    point = bytearray(ec_pubkey_parse(point_sec))
+    ec_pubkey_tweak_mul(point, scalar)
+    return ec_pubkey_serialize(point, EC_COMPRESSED)
+
+def sum_pubkeys(pubkeys):
+    """Sum a non-empty list of public keys, returning a 33-byte compressed point."""
+    acc = ec_pubkey_parse(pubkeys[0].sec())
+    for pk in pubkeys[1:]:
+        acc = ec_pubkey_combine(acc, ec_pubkey_parse(pk.sec()))
+    return ec_pubkey_serialize(acc, EC_COMPRESSED)
+
+# ============================================================================
+# Core ECDH Computation
+# ============================================================================
+
+def compute_ecdh_share(private_key, scan_key):
+    """
+    Compute ECDH share for a single private key.
+    
+    Args:
+        private_key: 32-byte private key
+        scan_key: The scan key to compute share with
+
+    Returns:
+        33-byte ECDH share (a·B_scan) compressed
+    """
+    if len(private_key) != 32:
+        raise SPFieldError("Private key must be 32 bytes")
+    return _tweak_mul(scan_key.sec(), private_key)
+
+def compute_global_ecdh_share(private_keys, scan_key):
+    """
+    Compute global ECDH share from multiple private keys.
+    
+    Args:
+        private_keys: List of 32-byte private keys (all eligible inputs)
+        scan_key: The scan key to compute share with
+
+    Returns:
+        33-byte ECDH share (a_sum·B_scan) compressed, or None if a_sum=0
+    """
+    if not private_keys:
+        return None
+
+    for priv in private_keys:
+        if not ec_seckey_verify(priv):
+            raise SPFieldError("Invalid private key")
+
+    a_sum = _sum_privkeys(private_keys)
+    if a_sum == 0:
+        return None
+
+    a_sum_bytes = a_sum.to_bytes(32, "big")
+    return _tweak_mul(scan_key.sec(), a_sum_bytes)
+
+# ============================================================================
+# Address and Label Logic
+# ============================================================================
+
+def apply_label(spend_pubkey, scan_privkey, m):
     """
     BIP-352 label tweak: B_m = B_spend + tagged_hash("BIP0352/Label", scan_priv || ser32(m))·G
-
-    `m` is a 32-bit unsigned integer. `m = 0` is reserved for change; callers
-    that expose labels to users (e.g. address generation) should reject it
-    themselves — this primitive allows it since change derivation needs it.
     """
     if not isinstance(m, int) or isinstance(m, bool):
         raise TypeError("Label must be an int.")
@@ -33,39 +121,29 @@ def apply_label(spend_pubkey: ec.PublicKey, scan_privkey: ec.PrivateKey, m: int)
         secp256k1.ec_pubkey_add(secp256k1.ec_pubkey_parse(spend_pubkey.sec()), tweak)
     )
 
-
 def encode_silent_payment_address(
-    scan_pubkey: ec.PublicKey,
-    spend_pubkey: ec.PublicKey,
-    network: str = "main",
-    version: int = 0,
-) -> str:
+    scan_pubkey,
+    spend_pubkey,
+    network="main",
+    version=0,
+):
     """Bech32m-encode a BIP-352 Silent Payment address from its scan/spend public keys."""
     data = bech32.convertbits(scan_pubkey.sec() + spend_pubkey.sec(), 8, 5)
     hrp = "sp" if network == "main" else "tsp"
     return bech32.bech32_encode(bech32.Encoding.BECH32M, hrp, [version] + data)
 
-
 def generate_silent_payment_address(
-    scan_privkey: ec.PrivateKey,
-    spend_pubkey: ec.PublicKey,
+    scan_privkey,
+    spend_pubkey,
     label=None,
-    network: str = "main",
-    version: int = 0,
-) -> str:
+    network="main",
+    version=0,
+):
     """
-    Adapted from https://github.com/bitcoin/bips/blob/master/bip-0352/reference.py
-
-    Generates the recipient's reusable silent payment address for a given:
-        * scan private key
-        * spend public key
-        * optional label for labeled addresses. It must be a 32-bit unsigned
-          integer `m`; `m = 0` is reserved for change and cannot be used here.
+    Generates the recipient's reusable silent payment address.
     """
     scan_pubkey = scan_privkey.get_public_key()
     if label is not None:
-        # Labels are 32-bit unsigned ints; m = 0 is reserved for change. See
-        # https://github.com/bitcoin/bips/blob/master/bip-0352.mediawiki#address-encoding
         if not isinstance(label, int) or isinstance(label, bool):
             raise TypeError("Label must be an int.")
         if not 1 <= label <= 0xFFFFFFFF:
@@ -78,8 +156,7 @@ def generate_silent_payment_address(
         scan_pubkey, spend_pubkey, network=network, version=version
     )
 
-
-def decode_silent_payment_address(address: str):
+def decode_silent_payment_address(address):
     """
     Decode a silent payment address and return the scan and spend public keys.
     """
@@ -122,35 +199,23 @@ def decode_silent_payment_address(address: str):
 
     return B_scan, B_spend
 
+# ============================================================================
+# Output Derivation
+# ============================================================================
 
-def get_input_hash(outpoints, sum_pubkey_bytes: bytes) -> bytes:
+def get_input_hash(outpoints, sum_pubkey_bytes):
+    """
+    BIP-352 input_hash: tagged_hash("BIP0352/Inputs", lowest_outpoint || A)
+    """
     if not outpoints:
         raise ValueError("get_input_hash requires at least one outpoint")
-    lowest_outpoint = sorted(outpoints, key=lambda o: o.serialize())[0]
+    lowest_outpoint = min(outpoints, key=lambda o: o.serialize())
     preimage = lowest_outpoint.serialize() + sum_pubkey_bytes
     return tagged_hash("BIP0352/Inputs", preimage)
-
 
 def derive_silent_payment_outputs(ecdh_share, spend_keys):
     """
     Derive silent payment outputs for recipients from a precomputed ECDH share.
-
-    Unlike create_outputs (which derives the share from input private keys),
-    this takes the ECDH shared-secret point directly, as used by the BIP-375
-    PSBT flow where shares are carried in the PSBT.
-
-    Each spend key is the final per-output spend key as carried in
-    PSBT_OUT_SP_V0_INFO (already label-tweaked when the address was labeled),
-    so no label tweak is applied here. ``k`` is the key's position in
-    ``spend_keys`` (the caller fixes the ordering).
-
-    Args:
-        ecdh_share: 33-byte compressed shared-secret point, already multiplied
-            by input_hash (validator does this before calling).
-        spend_keys: ordered list of recipient spend public keys.
-
-    Returns:
-        Dict mapping recipient position k to output pubkey x-only (32 bytes).
     """
     if not spend_keys:
         return {}
@@ -170,12 +235,50 @@ def derive_silent_payment_outputs(ecdh_share, spend_keys):
             ecdh_share + k.to_bytes(4, "big"),
         )
 
-        # P_k = B_spend + t_k·G
         p_k_internal = bytearray(ec_pubkey_parse(spend_key.sec()))
         ec_pubkey_tweak_add(p_k_internal, t_k)
         p_k = ec_pubkey_serialize(p_k_internal, EC_COMPRESSED)
 
-        # Store as p2tr output (extract xonly)
         result[k] = p_k[1:33]
 
     return result
+
+def derive_outputs_for_keys(priv_keys, outpoints, scan_spend_groups):
+    """
+    Core output derivation from private keys.
+
+    Args:
+        priv_keys: List of 32-byte normalized private key scalars.
+        outpoints: List of COutPoint for input_hash computation.
+        scan_spend_groups: {scan_key_bytes: (scan_key, [spend_key, ...])}.
+
+    Returns:
+        (a_sum_bytes, {scan_key_bytes: (ecdh_share, {k: xonly_bytes})}),
+        or None if the private key sum is zero.
+    """
+    for _scan_key, spend_keys in scan_spend_groups.values():
+        if len(spend_keys) > K_MAX:
+            raise ValueError(
+                "Too many outputs for one scan key: {} > {}".format(
+                    len(spend_keys), K_MAX
+                )
+            )
+
+    a_sum = _sum_privkeys(priv_keys)
+    if a_sum == 0:
+        return None
+        
+    a_sum_bytes = a_sum.to_bytes(32, "big")
+    A_sum_bytes = ec_pubkey_serialize(ec_pubkey_create(a_sum_bytes))
+    input_hash = get_input_hash(outpoints, A_sum_bytes)
+
+    results = {}
+    for sk_bytes, (scan_key, spend_keys) in scan_spend_groups.items():
+        ecdh_share = compute_ecdh_share(a_sum_bytes, scan_key)
+        adjusted_share = _tweak_mul(ecdh_share, input_hash)
+        outputs = derive_silent_payment_outputs(adjusted_share, spend_keys)
+        results[sk_bytes] = (ecdh_share, outputs)
+
+    return a_sum_bytes, results
+
+

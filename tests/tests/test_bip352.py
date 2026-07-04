@@ -8,7 +8,11 @@ from unittest import TestCase
 
 import pytest
 from embit.silent_payments import bip352
-from embit.silent_payments.ecdh import create_outputs
+from embit.silent_payments.bip352 import (
+    decode_silent_payment_address,
+    derive_outputs_for_keys,
+    normalize_xonly_keys,
+)
 from embit.ec import PrivateKey
 import os
 import json
@@ -17,6 +21,49 @@ from embit.script import Script, Witness
 from embit.transaction import COutPoint
 from embit.util.key import ECPubKey
 from embit.ec import NUMS_PUBKEY
+
+
+def _create_test_outputs(input_privkeys, outpoints, recipients):
+    """Test helper: reproduce the old create_outputs behaviour using public API.
+
+    Decodes silent-payment addresses, groups recipients by scan key,
+    calls derive_outputs_for_keys, and formats the result as
+    {address: [hex_xonly_pubkey, ...]}.
+    """
+    if not input_privkeys:
+        return {}
+
+    normalized = normalize_xonly_keys(input_privkeys)
+
+    decoded = {}
+    for addr in recipients:
+        if addr not in decoded:
+            decoded[addr] = decode_silent_payment_address(addr)
+
+    scan_spend_groups = {}
+    addr_lists = {}
+    for addr in recipients:
+        B_scan, B_spend = decoded[addr]
+        sk_bytes = B_scan.sec()
+        if sk_bytes not in scan_spend_groups:
+            scan_spend_groups[sk_bytes] = (B_scan, [])
+            addr_lists[sk_bytes] = []
+        scan_spend_groups[sk_bytes][1].append(B_spend)
+        addr_lists[sk_bytes].append(addr)
+
+    derivation = derive_outputs_for_keys(normalized, outpoints, scan_spend_groups)
+    if derivation is None:
+        return {}
+
+    _a_sum_bytes, results = derivation
+
+    from binascii import hexlify
+    output = {addr: [] for addr in decoded}
+    for sk_bytes, (_ecdh_share, outputs) in results.items():
+        for k, addr in enumerate(addr_lists[sk_bytes]):
+            output[addr].append(hexlify(outputs[k]).decode())
+
+    return output
 
 
 def get_input_pubkey(prevout_script, script_sig=None, witness=None) -> ECPubKey:
@@ -217,7 +264,7 @@ class BIP352Test(TestCase):
                     is_xonly = spk.script_type() == "p2tr"
                     input_privkeys.append((unhexlify(txin["private_key"]), is_xonly))
 
-                outputs_map = create_outputs(
+                outputs_map = _create_test_outputs(
                     input_privkeys=input_privkeys,
                     outpoints=outpoints,
                     recipients=given["recipients"],
@@ -245,7 +292,7 @@ class BIP352Test(TestCase):
         recipients = [vector["sp_address"]] * (bip352.K_MAX + 1)
 
         with pytest.raises(ValueError, match="Too many outputs"):
-            create_outputs(input_privkeys, outpoints, recipients)
+            _create_test_outputs(input_privkeys, outpoints, recipients)
 
     def test_derive_outputs_rejects_too_many_outputs_per_scan_key(self):
         """Should fail when the per-scan-key recipient list exceeds K_MAX"""
@@ -274,11 +321,11 @@ class BIP352Test(TestCase):
 
         # The shared secret depends only on (inputs, outpoints, scan key), so
         # single-address runs yield the per-k outputs to compare against.
-        out_x = create_outputs(input_privkeys, outpoints, [addr_x] * 3)[addr_x]
-        out_y = create_outputs(input_privkeys, outpoints, [addr_y] * 3)[addr_y]
+        out_x = _create_test_outputs(input_privkeys, outpoints, [addr_x] * 3)[addr_x]
+        out_y = _create_test_outputs(input_privkeys, outpoints, [addr_y] * 3)[addr_y]
 
         # Interleaved vout order [X, Y, X] -> k = 0, 1, 2.
-        result = create_outputs(
+        result = _create_test_outputs(
             input_privkeys, outpoints, [addr_x, addr_y, addr_x]
         )
 
