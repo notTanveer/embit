@@ -75,7 +75,8 @@ def compute_ecdh_share(private_key, scan_key):
 
 
 def compute_global_ecdh_share(private_keys, scan_key):
-    """Compute global ECDH share: a_sum·B_scan (33-byte compressed), or None if a_sum=0."""
+    """Compute global ECDH share: a_sum·B_scan (33-byte compressed),
+    or None if a_sum=0."""
     if not private_keys:
         return None
     for priv in private_keys:
@@ -91,7 +92,8 @@ def compute_global_ecdh_share(private_keys, scan_key):
 
 
 def apply_label(spend_pubkey, scan_privkey, m):
-    """BIP-352 label tweak: B_m = B_spend + tagged_hash("BIP0352/Label", scan_priv || ser32(m))·G"""
+    """BIP-352 label tweak:
+    B_m = B_spend + tagged_hash("BIP0352/Label", scan_priv || ser32(m))·G"""
     if not isinstance(m, int) or isinstance(m, bool):
         raise TypeError("Label must be an int.")
     if not 0 <= m <= 0xFFFFFFFF:
@@ -103,7 +105,8 @@ def apply_label(spend_pubkey, scan_privkey, m):
 
 
 def encode_silent_payment_address(scan_pubkey, spend_pubkey, network="main", version=0):
-    """Bech32m-encode a BIP-352 Silent Payment address from its scan/spend public keys."""
+    """Bech32m-encode a BIP-352 Silent Payment address from its scan/spend
+    public keys."""
     data = bech32.convertbits(scan_pubkey.sec() + spend_pubkey.sec(), 8, 5)
     hrp = "sp" if network == "main" else "tsp"
     return bech32.bech32_encode(bech32.Encoding.BECH32M, hrp, [version] + data)
@@ -153,7 +156,10 @@ def decode_silent_payment_address(address):
     except bech32.Bech32DecodeError:
         raise ValueError("Invalid silent payment address: conversion failed")
     try:
-        return ec.PublicKey.parse(bytes(decoded[:33])), ec.PublicKey.parse(bytes(decoded[33:]))
+        return (
+            ec.PublicKey.parse(bytes(decoded[:33])),
+            ec.PublicKey.parse(bytes(decoded[33:])),
+        )
     except Exception as e:
         raise ValueError(
             "Invalid silent payment address: invalid public keys - {}".format(e)
@@ -172,7 +178,8 @@ def get_input_hash(outpoints, sum_pubkey_bytes):
 
 
 def derive_silent_payment_outputs(ecdh_share, spend_keys):
-    """Derive silent payment x-only outputs for recipients from a precomputed ECDH share."""
+    """Derive silent payment x-only outputs for recipients from a
+    precomputed ECDH share."""
     if not spend_keys:
         return {}
     if len(spend_keys) > K_MAX:
@@ -293,15 +300,24 @@ def get_eligible_inputs(inputs, has_sp_outputs=False):
             wv = witness_version(script)
             if wv is not None and wv > 1:
                 raise SPValidationError(
-                    "Input {} spends a Segwit version > 1 output with SP outputs".format(i)
+                    "Input {} spends a Segwit version > 1 output with SP "
+                    "outputs".format(i)
                 )
         if stype == "p2tr":
-            if inp.taproot_internal_key is not None and inp.taproot_internal_key.xonly() == _NUMS_XONLY:
+            is_nums = (
+                inp.taproot_internal_key is not None
+                and inp.taproot_internal_key.xonly() == _NUMS_XONLY
+            )
+            if is_nums:
                 continue
             eligible.append(i)
         elif stype in {"p2pkh", "p2wpkh"}:
             eligible.append(i)
-        elif stype == "p2sh" and inp.redeem_script and inp.redeem_script.script_type() == "p2wpkh":
+        elif (
+            stype == "p2sh"
+            and inp.redeem_script
+            and inp.redeem_script.script_type() == "p2wpkh"
+        ):
             eligible.append(i)
     return eligible
 
@@ -355,7 +371,10 @@ def derive_sp_output_scripts(psbt, eligible=None, eligible_pubkeys=None):
                 if share is None:
                     continue
                 parsed = ec_pubkey_parse(share)
-                share_sum = parsed if share_sum is None else ec_pubkey_combine(share_sum, parsed)
+                if share_sum is None:
+                    share_sum = parsed
+                else:
+                    share_sum = ec_pubkey_combine(share_sum, parsed)
                 contributing += 1
             if share_sum is None or contributing != len(eligible):
                 continue

@@ -40,7 +40,9 @@ def _point_mul(scalar_bytes, base_sec):
 
 def _point_mul_or_inf(base_sec, scalar_int):
     """scalar * base → handle, or None (point at infinity) when scalar == 0."""
-    return None if scalar_int == 0 else _point_mul(scalar_int.to_bytes(32, "big"), base_sec)
+    if scalar_int == 0:
+        return None
+    return _point_mul(scalar_int.to_bytes(32, "big"), base_sec)
 
 
 def _add_points(p1, p2):
@@ -102,9 +104,9 @@ def generate_dleq_proof(a_bytes, B_sec, r=None, m=None, G=None):
     t_int = a_int ^ int.from_bytes(hashes.tagged_hash(DLEQ_TAG_AUX, r), "big")
     m_prime = m if m is not None else b""
 
+    nonce_preimage = t_int.to_bytes(32, "big") + A_compressed + C_compressed + m_prime
     k = int.from_bytes(
-        hashes.tagged_hash(DLEQ_TAG_NONCE, t_int.to_bytes(32, "big") + A_compressed + C_compressed + m_prime),
-        "big",
+        hashes.tagged_hash(DLEQ_TAG_NONCE, nonce_preimage), "big"
     ) % SECP256K1_ORDER
     if k == 0:
         raise DLEQError("Derived nonce k is zero")
@@ -113,10 +115,13 @@ def generate_dleq_proof(a_bytes, B_sec, r=None, m=None, G=None):
     R1_compressed = _serialize(_point_mul(k_bytes, G_sec))
     R2_compressed = _serialize(_point_mul(k_bytes, B_sec))
 
-    e = int.from_bytes(hashes.tagged_hash(
-        DLEQ_TAG_CHALLENGE,
-        A_compressed + B_sec + C_compressed + G_sec + R1_compressed + R2_compressed + m_prime,
-    ), "big")
+    challenge_preimage = (
+        A_compressed + B_sec + C_compressed + G_sec
+        + R1_compressed + R2_compressed + m_prime
+    )
+    e = int.from_bytes(
+        hashes.tagged_hash(DLEQ_TAG_CHALLENGE, challenge_preimage), "big"
+    )
     s = (k + e * a_int) % SECP256K1_ORDER
     proof = e.to_bytes(32, "big") + s.to_bytes(32, "big")
 

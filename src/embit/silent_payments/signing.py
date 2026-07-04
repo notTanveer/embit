@@ -1,8 +1,9 @@
 """
-BIP-375 signing helpers: DLEQ proof wrappers and PSBT input private key resolution.
+BIP-375 signing helpers: DLEQ proof wrappers and PSBT input private key
+resolution.
 
-Split from ecdh.py — these functions need HD key derivation / root / fingerprint,
-making them signing-specific rather than pure crypto.
+These need HD key derivation / root / fingerprint, unlike the pure crypto
+in bip352.py.
 """
 
 from ..base import EmbitError
@@ -26,7 +27,10 @@ def compute_dleq_proof(private_key, scan_key, ecdh_share, aux_rand=None, verify=
     """Generate a 64-byte DLEQ proof for an input's ECDH share (a·B_scan)."""
     if verify and compute_ecdh_share(private_key, scan_key) != ecdh_share:
         raise SPFieldError("ecdh_share does not match private_key and scan_key")
-    r = aux_rand if aux_rand is not None else _default_aux_rand(private_key, scan_key.sec())
+    if aux_rand is not None:
+        r = aux_rand
+    else:
+        r = _default_aux_rand(private_key, scan_key.sec())
     try:
         return dleq.generate_dleq_proof(private_key, scan_key.sec(), r=r)
     except dleq.DLEQError as e:
@@ -48,7 +52,10 @@ def compute_global_dleq_proof(
     if verify and tweak_mul(scan_key.sec(), a_sum_bytes) != global_share:
         raise SPFieldError("global_share does not match private_keys and scan_key")
 
-    r = aux_rand if aux_rand is not None else _default_aux_rand(a_sum_bytes, scan_key.sec())
+    if aux_rand is not None:
+        r = aux_rand
+    else:
+        r = _default_aux_rand(a_sum_bytes, scan_key.sec())
     try:
         return dleq.generate_dleq_proof(a_sum_bytes, scan_key.sec(), r=r)
     except dleq.DLEQError as e:

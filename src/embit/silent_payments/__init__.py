@@ -1,4 +1,5 @@
-"""Silent Payments (BIP-352/374/375/376): addresses, ECDH shares, DLEQ proofs, and PSBT support."""
+"""Silent Payments (BIP-352/374/375/376): addresses, ECDH shares, DLEQ
+proofs, and PSBT support."""
 
 from . import bip352, dleq, signing
 from .fields import SPFieldError, SPValidationError, SilentPaymentData
