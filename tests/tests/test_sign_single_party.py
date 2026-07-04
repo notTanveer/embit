@@ -11,7 +11,10 @@ import unittest
 from embit import bip32, ec
 from embit.psbt import DerivationPath
 from embit.silent_payments import SilentPaymentsPSBT as PSBT
-from embit.silent_payments.psbt import SPInputScope as InputScope, SPOutputScope as OutputScope
+from embit.silent_payments.psbt import (
+    SPInputScope as InputScope,
+    SPOutputScope as OutputScope,
+)
 from embit.silent_payments import SPValidationError, SilentPaymentData
 from embit.silent_payments.validator import BIP375Validator
 from embit.silent_payments.signing import compute_dleq_proof
@@ -107,12 +110,14 @@ class TestSignSingleParty(unittest.TestCase):
         scan_pub, spend_pub = _sp_keys()
         psbt = PSBT.create_v2()
 
-        redeem_script = Script(bytes([0x51, 0x21]) + bytes(33) + bytes([0x51, 0xae]))
+        redeem_script = Script(bytes([0x51, 0x21]) + bytes(33) + bytes([0x51, 0xAE]))
         inp = InputScope()
         inp.txid = bytes([0xAA] * 32)
         inp.vout = 0
         inp.sequence = 0xFFFFFFFE
-        inp.witness_utxo = TransactionOutput(value=100_000, script_pubkey=p2wsh(redeem_script))
+        inp.witness_utxo = TransactionOutput(
+            value=100_000, script_pubkey=p2wsh(redeem_script)
+        )
         psbt.add_input(inp)
 
         out = OutputScope()
@@ -135,10 +140,16 @@ class TestSignSingleParty(unittest.TestCase):
         inp.txid = bytes([0xBB] * 32)
         inp.vout = 0
         inp.sequence = 0xFFFFFFFE
-        inp.witness_utxo = TransactionOutput(value=50_000, script_pubkey=p2wpkh(foreign_pub))
-        inp.bip32_derivations[foreign_pub] = DerivationPath(foreign_root.my_fingerprint, [0, 0])
+        inp.witness_utxo = TransactionOutput(
+            value=50_000, script_pubkey=p2wpkh(foreign_pub)
+        )
+        inp.bip32_derivations[foreign_pub] = DerivationPath(
+            foreign_root.my_fingerprint, [0, 0]
+        )
         # Foreign co-signer already contributed their own share.
-        foreign_share = compute_ecdh_share(foreign_root.derive([0, 0]).key.secret, scan_pub)
+        foreign_share = compute_ecdh_share(
+            foreign_root.derive([0, 0]).key.secret, scan_pub
+        )
         foreign_proof = compute_dleq_proof(
             foreign_root.derive([0, 0]).key.secret, scan_pub, foreign_share
         )
@@ -220,9 +231,7 @@ class TestFillOutputScripts(unittest.TestCase):
         inp.txid = bytes([0xDD] * 32)
         inp.vout = 0
         inp.sequence = 0xFFFFFFFE
-        inp.witness_utxo = TransactionOutput(
-            value=100_000, script_pubkey=p2wpkh(pub)
-        )
+        inp.witness_utxo = TransactionOutput(value=100_000, script_pubkey=p2wpkh(pub))
         psbt.add_input(inp)
         out = OutputScope()
         out.value = 95_000

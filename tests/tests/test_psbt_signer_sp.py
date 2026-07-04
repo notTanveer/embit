@@ -186,9 +186,7 @@ class TestE2EP2WPKHFromVector(unittest.TestCase):
         pub = ec.PublicKey.parse(unhexlify(self.PUB_HEX))
         C = ec.PublicKey.parse(share)
         self.assertTrue(
-            dleq.verify_dleq_proof(
-                pub.sec(), unhexlify(self.SCAN_HEX), C.sec(), proof
-            )
+            dleq.verify_dleq_proof(pub.sec(), unhexlify(self.SCAN_HEX), C.sec(), proof)
         )
 
     def test_full_psbt_sign_produces_signature(self):
@@ -547,7 +545,9 @@ class TestSpendFromSP(unittest.TestCase):
     def test_foreign_derivation_not_signed(self):
         """A derivation with a non-matching fingerprint is not signed."""
         root = _root()
-        inp, _, _ = self._input(root, bytes([0x11] * 32), fingerprint=b"\xff\xff\xff\xff")
+        inp, _, _ = self._input(
+            root, bytes([0x11] * 32), fingerprint=b"\xff\xff\xff\xff"
+        )
         psbt = self._dest_psbt(root, inp)
 
         self.assertEqual(psbt._sign_sp_spends(root), 0)

@@ -168,7 +168,9 @@ class BIP375Validator:
                     # Can't verify without script (incomplete PSBT)
                     continue
 
-                self._verify_global_dleq_proof(scan_key_bytes, out_idx, eligible_pubkeys)
+                self._verify_global_dleq_proof(
+                    scan_key_bytes, out_idx, eligible_pubkeys
+                )
             else:
                 # Check per-input ECDH shares
                 for inp_idx in eligible_inputs:

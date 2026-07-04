@@ -58,6 +58,7 @@ def _create_test_outputs(input_privkeys, outpoints, recipients):
     _a_sum_bytes, results = derivation
 
     from binascii import hexlify
+
     output = {addr: [] for addr in decoded}
     for sk_bytes, (_ecdh_share, outputs) in results.items():
         for k, addr in enumerate(addr_lists[sk_bytes]):
@@ -128,7 +129,10 @@ def get_input_pubkey(prevout_script, script_sig=None, witness=None) -> ECPubKey:
             # Script-path spend with NUMS internal key: not key-spendable
             if len(wstack) > 1:
                 control_block = wstack[-1]
-                if len(control_block) >= 33 and control_block[1:33] == NUMS_PUBKEY.xonly():
+                if (
+                    len(control_block) >= 33
+                    and control_block[1:33] == NUMS_PUBKEY.xonly()
+                ):
                     return ECPubKey()
         # Key-path spend: reconstruct even-y compressed SEC from x-only
         if len(spk.data) >= 34:

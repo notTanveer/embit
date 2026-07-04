@@ -287,9 +287,7 @@ class SilentPaymentsPSBT(PSBT):
             and sighash is not None
             and sighash not in (SIGHASH.ALL, SIGHASH.DEFAULT)
         ):
-            raise SPValidationError(
-                "Silent payment signing requires SIGHASH_ALL"
-            )
+            raise SPValidationError("Silent payment signing requires SIGHASH_ALL")
         if sighash is not None:
             counter = super().sign_with(root, sighash=sighash, **kwargs)
         else:
@@ -481,7 +479,10 @@ class SilentPaymentsPSBT(PSBT):
         scan_spend_groups = {}
         output_indices = {}
         for sk_bytes, (scan_key, pairs) in groups.items():
-            scan_spend_groups[sk_bytes] = (scan_key, [spend_key for _, spend_key in pairs])
+            scan_spend_groups[sk_bytes] = (
+                scan_key,
+                [spend_key for _, spend_key in pairs],
+            )
             output_indices[sk_bytes] = [out_idx for out_idx, _ in pairs]
 
         eligible = get_eligible_inputs(self.inputs, has_sp_outputs=True)
@@ -495,7 +496,9 @@ class SilentPaymentsPSBT(PSBT):
         priv_keys = []
         foreign_inputs = []
         for i in eligible:
-            priv = resolve_input_privkey(self.inputs[i], root, fingerprint, derive_hdkey)
+            priv = resolve_input_privkey(
+                self.inputs[i], root, fingerprint, derive_hdkey
+            )
             if priv is None:
                 foreign_inputs.append(i)
             else:
@@ -506,9 +509,7 @@ class SilentPaymentsPSBT(PSBT):
                 raise SPValidationError(
                     "Silent Payment signing failed: input(s) {} belong to another "
                     "signer; multi-party Silent Payment sends are not "
-                    "supported.".format(
-                        ", ".join(str(i) for i in foreign_inputs)
-                    )
+                    "supported.".format(", ".join(str(i) for i in foreign_inputs))
                 )
             raise SPValidationError(
                 "Silent Payment signing failed: no eligible input is controlled "
@@ -523,9 +524,7 @@ class SilentPaymentsPSBT(PSBT):
 
         outpoints = all_outpoints(self)
 
-        derivation = derive_outputs_for_keys(
-            priv_keys, outpoints, scan_spend_groups
-        )
+        derivation = derive_outputs_for_keys(priv_keys, outpoints, scan_spend_groups)
         if derivation is None:
             raise SPValidationError(
                 "Silent Payment signing failed: private key sum is zero."
@@ -537,13 +536,15 @@ class SilentPaymentsPSBT(PSBT):
             self.sp_ecdh_shares[sk_bytes] = ecdh_share
             scan_key = scan_spend_groups[sk_bytes][0]
             self.sp_dleq_proofs[sk_bytes] = compute_global_dleq_proof(
-                priv_keys, scan_key, ecdh_share,
-                aux_rand=aux_rand, verify=False, _a_sum_bytes=a_sum_bytes,
+                priv_keys,
+                scan_key,
+                ecdh_share,
+                aux_rand=aux_rand,
+                verify=False,
+                _a_sum_bytes=a_sum_bytes,
             )
             for pos, out_idx in enumerate(output_indices[sk_bytes]):
-                self.outputs[out_idx].script_pubkey = Script(
-                    b"\x51\x20" + outputs[pos]
-                )
+                self.outputs[out_idx].script_pubkey = Script(b"\x51\x20" + outputs[pos])
 
         return self.sign_with(root, with_sp_shares=False)
 

@@ -105,9 +105,10 @@ def generate_dleq_proof(a_bytes, B_sec, r=None, m=None, G=None):
     m_prime = m if m is not None else b""
 
     nonce_preimage = t_int.to_bytes(32, "big") + A_compressed + C_compressed + m_prime
-    k = int.from_bytes(
-        hashes.tagged_hash(DLEQ_TAG_NONCE, nonce_preimage), "big"
-    ) % SECP256K1_ORDER
+    k = (
+        int.from_bytes(hashes.tagged_hash(DLEQ_TAG_NONCE, nonce_preimage), "big")
+        % SECP256K1_ORDER
+    )
     if k == 0:
         raise DLEQError("Derived nonce k is zero")
 
@@ -116,8 +117,13 @@ def generate_dleq_proof(a_bytes, B_sec, r=None, m=None, G=None):
     R2_compressed = _serialize(_point_mul(k_bytes, B_sec))
 
     challenge_preimage = (
-        A_compressed + B_sec + C_compressed + G_sec
-        + R1_compressed + R2_compressed + m_prime
+        A_compressed
+        + B_sec
+        + C_compressed
+        + G_sec
+        + R1_compressed
+        + R2_compressed
+        + m_prime
     )
     e = int.from_bytes(
         hashes.tagged_hash(DLEQ_TAG_CHALLENGE, challenge_preimage), "big"
@@ -158,10 +164,19 @@ def verify_dleq_proof(A_sec, B_sec, C_sec, proof, m=None, G=None):
         if R2 is None:
             return False
 
-        e_check = int.from_bytes(hashes.tagged_hash(
-            DLEQ_TAG_CHALLENGE,
-            A_sec + B_sec + C_sec + G_sec + _serialize(R1) + _serialize(R2) + m_prime,
-        ), "big")
+        e_check = int.from_bytes(
+            hashes.tagged_hash(
+                DLEQ_TAG_CHALLENGE,
+                A_sec
+                + B_sec
+                + C_sec
+                + G_sec
+                + _serialize(R1)
+                + _serialize(R2)
+                + m_prime,
+            ),
+            "big",
+        )
         return e == e_check
     except (ValueError, OverflowError):
         return False
