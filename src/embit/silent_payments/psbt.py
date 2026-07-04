@@ -10,7 +10,7 @@ Sections:
 import io
 from collections import OrderedDict
 
-from .. import ec, hashes
+from .. import ec
 from ..base import EmbitError
 from ..script import Witness
 from ..psbt import (
@@ -20,7 +20,9 @@ from ..psbt import (
     OutputScope,
     PSBTError,
     SIGHASH,
+    derive_hdkey,
     read_string,
+    resolve_signing_root,
     ser_string,
 )
 from . import dleq
@@ -31,8 +33,10 @@ from .ecdh import (
     compute_global_dleq_proof,
     derive_sp_output_scripts,
     get_eligible_inputs,
+    match_sp_spend_base,
     pubkey_hash_from_script,
     input_public_key,
+    resolve_input_privkey,
 )
 from .fields import SilentPaymentData, SPFieldError, SPValidationError
 
@@ -301,31 +305,8 @@ class SilentPaymentsPSBT(PSBT):
         keys (which match by key material instead).  ``can_sign`` is False when
         ``root`` is a public-only descriptor key that cannot produce signatures.
         """
-        fingerprint = None
-        if hasattr(root, "origin"):
-            if not getattr(root, "is_private", True):
-                return None, False
-            if getattr(root, "is_extended", False):
-                fingerprint = root.fingerprint
-        if not fingerprint and hasattr(root, "my_fingerprint"):
-            fingerprint = root.my_fingerprint
-        return fingerprint, True
-
-    @staticmethod
-    def _derive_hdkey(root, derivation):
-        """Derive the HDKey for ``derivation``, honoring the root's origin prefix.
-
-        Returns the derived HDKey, or None if the origin prefix doesn't match.
-        """
-        der = derivation.derivation
-        if hasattr(root, "origin"):
-            if root.origin:
-                prefix = root.origin.derivation
-                if der[: len(prefix)] != prefix:
-                    return None
-                der = der[len(prefix) :]
-            return root.key.derive(der)
-        return root.derive(der)
+        fingerprint, can_sign, _root = resolve_signing_root(root)
+        return fingerprint, can_sign
 
     def sign_input_with_sp_tweak(
         self,
@@ -356,31 +337,6 @@ class SilentPaymentsPSBT(PSBT):
         inp.taproot_key_sig = sigdata
         return 1
 
-    def _match_sp_spend_base(self, inp, root, fingerprint):
-        """Return the base PrivateKey for a BIP-376 SP-spend input, matched via
-        ``sp_spend_bip32_derivations`` for ``fingerprint`` (or the raw ``root``
-        key when there's no fingerprint), or None if ``root`` does not control
-        this input's SP spend key.
-
-        Returns the *untweaked* base key -- callers apply ``sp_spend_tweak``
-        themselves, since the send path normalizes to even-Y for ECDH
-        summation while the spend/signing path leaves parity to Schnorr
-        signing.
-        """
-        if fingerprint:
-            for pub_bytes, derivation in inp.sp_spend_bip32_derivations.items():
-                if derivation.fingerprint != fingerprint:
-                    continue
-                hdkey = self._derive_hdkey(root, derivation)
-                if hdkey is None or hdkey.xonly() != pub_bytes[1:]:
-                    continue
-                return hdkey.key
-
-        if fingerprint is None and hasattr(root, "secret"):
-            return root
-
-        return None
-
     def _sign_sp_spends(self, root) -> int:
         """BIP-376: sign inputs that carry sp_tweak using sp_spend_bip32_derivations."""
         fingerprint, can_sign = self._signing_fingerprint(root)
@@ -394,84 +350,13 @@ class SilentPaymentsPSBT(PSBT):
             if inp.taproot_key_sig is not None:
                 continue
 
-            priv_key = self._match_sp_spend_base(inp, root, fingerprint)
+            priv_key = match_sp_spend_base(inp, root, fingerprint, derive_hdkey)
             if priv_key is None:
                 continue
 
             counter += self.sign_input_with_sp_tweak(priv_key, i, inp)
 
         return counter
-
-    def _resolve_input_privkey(self, inp, root, fingerprint):
-        """Return the 32-byte private scalar 'a' for an eligible input's ECDH
-        share, or None if ``root`` does not control the input.
-
-        For taproot inputs this is the (even-Y) output private key per the
-        BIP-352 negation rule, obtained via taproot_tweak; for the other types
-        it is the input key matched by derivation or by script hash.
-        """
-        is_taproot = (
-            inp.script_pubkey is not None
-            and inp.script_pubkey.script_type() == "p2tr"
-        )
-
-        if is_taproot:
-            output_xonly = bytes(inp.script_pubkey.data[2:34])
-
-            # BIP-376 spend-from input: the key is the tweaked spend key
-            # b_spend + t, normalized to even Y so it can be summed into the
-            # BIP-352 shared secret (Schnorr signing handles its own parity).
-            # Matched via sp_spend_bip32_derivations rather than the BIP-86 path.
-            sp_tweak = getattr(inp, "sp_tweak", None)
-            if sp_tweak is not None:
-                base = self._match_sp_spend_base(inp, root, fingerprint)
-                if base is None:
-                    return None
-                try:
-                    out_priv = base.sp_spend_tweak(sp_tweak).even_y()
-                except (EmbitError, ValueError):
-                    return None
-                if out_priv.xonly() == output_xonly:
-                    return out_priv.secret
-                return None
-
-            merkle = inp.taproot_merkle_root or b""
-            if fingerprint:
-                for pub, (_leaves, derivation) in (
-                    inp.taproot_bip32_derivations.items()
-                ):
-                    if derivation.fingerprint != fingerprint:
-                        continue
-                    hdkey = self._derive_hdkey(root, derivation)
-                    if hdkey is None or hdkey.xonly() != pub.xonly():
-                        continue
-                    out_priv = hdkey.key.taproot_tweak(merkle)
-                    if out_priv.xonly() == output_xonly:
-                        return out_priv.secret
-            if fingerprint is None and hasattr(root, "secret"):
-                try:
-                    out_priv = root.taproot_tweak(merkle)
-                except (EmbitError, ValueError):
-                    return None
-                if out_priv.xonly() == output_xonly:
-                    return out_priv.secret
-            return None
-
-        if fingerprint:
-            for pub, derivation in inp.bip32_derivations.items():
-                if derivation.fingerprint != fingerprint:
-                    continue
-                hdkey = self._derive_hdkey(root, derivation)
-                if hdkey is None or hdkey.xonly() != pub.xonly():
-                    continue
-                return hdkey.key.secret
-
-        if fingerprint is None and hasattr(root, "secret"):
-            pkh = pubkey_hash_from_script(inp.script_pubkey, inp.redeem_script)
-            if pkh is not None and pkh == hashes.hash160(root.get_public_key().sec()):
-                return root.secret
-
-        return None
 
     def _verify_existing_sp_shares(self, eligible, scan_keys) -> None:
         """Verify DLEQ proofs of ECDH shares already present on eligible inputs.
@@ -532,7 +417,7 @@ class SilentPaymentsPSBT(PSBT):
         for i in eligible:
             inp = self.inputs[i]
 
-            priv_bytes = self._resolve_input_privkey(inp, root, fingerprint)
+            priv_bytes = resolve_input_privkey(inp, root, fingerprint, derive_hdkey)
             if priv_bytes is None:
                 continue
 
@@ -608,7 +493,7 @@ class SilentPaymentsPSBT(PSBT):
         priv_keys = []
         foreign_inputs = []
         for i in eligible:
-            priv = self._resolve_input_privkey(self.inputs[i], root, fingerprint)
+            priv = resolve_input_privkey(self.inputs[i], root, fingerprint, derive_hdkey)
             if priv is None:
                 foreign_inputs.append(i)
             else:

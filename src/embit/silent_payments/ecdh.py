@@ -3,6 +3,7 @@ BIP-375 ECDH share and DLEQ proof computation, plus input eligibility.
 """
 
 from .. import ec
+from ..base import EmbitError
 from ..hashes import hash160, tagged_hash
 from ..misc import urandom
 from ..script import Script
@@ -259,6 +260,110 @@ def input_public_key(inp):
             unique.append(pubkey)
     if len(unique) == 1:
         return unique[0]
+    return None
+
+
+def match_sp_spend_base(inp, root, fingerprint, derive_hdkey):
+    """Return the base PrivateKey for a BIP-376 SP-spend input, matched via
+    ``sp_spend_bip32_derivations`` for ``fingerprint`` (or the raw ``root``
+    key when there's no fingerprint), or None if ``root`` does not control
+    this input's SP spend key.
+
+    Returns the *untweaked* base key -- callers apply ``sp_spend_tweak``
+    themselves, since the send path normalizes to even-Y for ECDH summation
+    while the spend/signing path leaves parity to Schnorr signing.
+
+    ``derive_hdkey`` is injected by the caller (PSBT-aware derivation
+    honoring a descriptor key's origin prefix) to keep this module free of
+    a psbt.py import.
+    """
+    if fingerprint:
+        for pub_bytes, derivation in inp.sp_spend_bip32_derivations.items():
+            if derivation.fingerprint != fingerprint:
+                continue
+            hdkey = derive_hdkey(root, derivation)
+            if hdkey is None or hdkey.xonly() != pub_bytes[1:]:
+                continue
+            return hdkey.key
+
+    if fingerprint is None and hasattr(root, "secret"):
+        return root
+
+    return None
+
+
+def resolve_input_privkey(inp, root, fingerprint, derive_hdkey):
+    """Return the 32-byte private scalar 'a' for an eligible input's ECDH
+    share, or None if ``root`` does not control the input.
+
+    For taproot inputs this is the (even-Y) output private key per the
+    BIP-352 negation rule, obtained via taproot_tweak; for the other types
+    it is the input key matched by derivation or by script hash.
+
+    ``derive_hdkey`` is injected for the same reason as in
+    ``match_sp_spend_base``.
+    """
+    is_taproot = (
+        inp.script_pubkey is not None
+        and inp.script_pubkey.script_type() == "p2tr"
+    )
+
+    if is_taproot:
+        output_xonly = bytes(inp.script_pubkey.data[2:34])
+
+        # BIP-376 spend-from input: the key is the tweaked spend key
+        # b_spend + t, normalized to even Y so it can be summed into the
+        # BIP-352 shared secret (Schnorr signing handles its own parity).
+        # Matched via sp_spend_bip32_derivations rather than the BIP-86 path.
+        sp_tweak = getattr(inp, "sp_tweak", None)
+        if sp_tweak is not None:
+            base = match_sp_spend_base(inp, root, fingerprint, derive_hdkey)
+            if base is None:
+                return None
+            try:
+                out_priv = base.sp_spend_tweak(sp_tweak).even_y()
+            except (EmbitError, ValueError):
+                return None
+            if out_priv.xonly() == output_xonly:
+                return out_priv.secret
+            return None
+
+        merkle = inp.taproot_merkle_root or b""
+        if fingerprint:
+            for pub, (_leaves, derivation) in (
+                inp.taproot_bip32_derivations.items()
+            ):
+                if derivation.fingerprint != fingerprint:
+                    continue
+                hdkey = derive_hdkey(root, derivation)
+                if hdkey is None or hdkey.xonly() != pub.xonly():
+                    continue
+                out_priv = hdkey.key.taproot_tweak(merkle)
+                if out_priv.xonly() == output_xonly:
+                    return out_priv.secret
+        if fingerprint is None and hasattr(root, "secret"):
+            try:
+                out_priv = root.taproot_tweak(merkle)
+            except (EmbitError, ValueError):
+                return None
+            if out_priv.xonly() == output_xonly:
+                return out_priv.secret
+        return None
+
+    if fingerprint:
+        for pub, derivation in inp.bip32_derivations.items():
+            if derivation.fingerprint != fingerprint:
+                continue
+            hdkey = derive_hdkey(root, derivation)
+            if hdkey is None or hdkey.xonly() != pub.xonly():
+                continue
+            return hdkey.key.secret
+
+    if fingerprint is None and hasattr(root, "secret"):
+        pkh = pubkey_hash_from_script(inp.script_pubkey, inp.redeem_script)
+        if pkh is not None and pkh == hash160(root.get_public_key().sec()):
+            return root.secret
+
     return None
 
 

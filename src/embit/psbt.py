@@ -49,6 +49,47 @@ def skip_string(stream) -> int:
     return len(compact.to_bytes(l)) + l
 
 
+def resolve_signing_root(root):
+    """Resolve the signing fingerprint for ``root``, honoring descriptor-key
+    wrapping.
+
+    Returns ``(fingerprint, can_sign, root)``. ``fingerprint`` is None for
+    raw/WIF keys (matched by key material instead). ``can_sign`` is False
+    when ``root`` is a public-only descriptor key that cannot sign. ``root``
+    is unwrapped to its underlying WIF key (``root.key``) when it was a
+    non-extended descriptor key; otherwise it is returned unchanged.
+    """
+    fingerprint = None
+    if hasattr(root, "origin"):
+        if not root.is_private:  # pubkey can't sign
+            return None, False, root
+        if root.is_extended:  # use fingerprint only for HDKey
+            fingerprint = root.fingerprint
+        else:
+            root = root.key  # WIF key
+    if not fingerprint and hasattr(root, "my_fingerprint"):
+        fingerprint = root.my_fingerprint
+    return fingerprint, True, root
+
+
+def derive_hdkey(root, derivation):
+    """Derive the HDKey for ``derivation``, honoring a descriptor key's origin
+    prefix.
+
+    Returns the derived HDKey, or None if ``derivation`` doesn't start with
+    ``root.origin``'s prefix (the caller should skip this candidate).
+    """
+    der = derivation.derivation
+    if hasattr(root, "origin"):
+        if root.origin:
+            prefix = root.origin.derivation
+            if der[: len(prefix)] != prefix:
+                return None
+            der = der[len(prefix) :]
+        return root.key.derive(der)
+    return root.derive(der)
+
+
 class DerivationPath(EmbitBase):
     def __init__(self, fingerprint: bytes, derivation: list):
         self.fingerprint = fingerprint
@@ -1339,19 +1380,9 @@ class PSBT(EmbitBase):
                     counter += self.sign_with(k, sighash)
             return counter
 
-        # if WIF - fingerprint is None
-        fingerprint = None
-        # if descriptor key
-        if hasattr(root, "origin"):
-            if not root.is_private:  # pubkey can't sign
-                return 0
-            if root.is_extended:  # use fingerprint only for HDKey
-                fingerprint = root.fingerprint
-            else:
-                root = root.key  # WIF key
-        # if HDKey
-        if not fingerprint and hasattr(root, "my_fingerprint"):
-            fingerprint = root.my_fingerprint
+        fingerprint, can_sign, root = resolve_signing_root(root)
+        if not can_sign:
+            return 0
 
         rootpub = root.get_public_key()
         sec = rootpub.sec()
@@ -1403,17 +1434,10 @@ class PSBT(EmbitBase):
             # get derived keys for signing
             derived_keypairs = OrderedDict()  # (prv, pub)
             for pub, derivation in bip32_derivations:
-                der = derivation.derivation
-                # descriptor key has origin derivation that we take into account
-                if hasattr(root, "origin"):
-                    if root.origin:
-                        if root.origin.derivation != der[: len(root.origin.derivation)]:
-                            # derivation doesn't match - go to next input
-                            continue
-                        der = der[len(root.origin.derivation) :]
-                    hdkey = root.key.derive(der)
-                else:
-                    hdkey = root.derive(der)
+                hdkey = derive_hdkey(root, derivation)
+                if hdkey is None:
+                    # derivation doesn't match - go to next candidate
+                    continue
 
                 if hdkey.xonly() != pub.xonly():
                     raise PSBTError("Derivation path doesn't look right")

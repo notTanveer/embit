@@ -19,8 +19,9 @@ from pathlib import Path
 
 from embit import bip32, ec
 from embit.silent_payments import dleq
-from embit.psbt import DerivationPath
+from embit.psbt import DerivationPath, derive_hdkey
 from embit.silent_payments import SilentPaymentsPSBT as PSBT
+from embit.silent_payments.ecdh import resolve_input_privkey
 from embit.silent_payments.psbt import (
     SPInputScope as InputScope,
     SPOutputScope as OutputScope,
@@ -498,7 +499,9 @@ class TestSpendFromSP(unittest.TestCase):
         inp, _, _ = self._input(root, tweak)
         psbt = self._dest_psbt(root, inp)
 
-        secret = psbt._resolve_input_privkey(psbt.inputs[0], root, root.my_fingerprint)
+        secret = resolve_input_privkey(
+            psbt.inputs[0], root, root.my_fingerprint, derive_hdkey
+        )
         self.assertIsNotNone(secret)
         expected = spend_priv.sp_spend_tweak(tweak).even_y()
         self.assertEqual(secret, expected.secret)
@@ -536,7 +539,9 @@ class TestSpendFromSP(unittest.TestCase):
         self.assertEqual(psbt._sign_sp_spends(root), 0)
         self.assertIsNone(psbt.inputs[0].taproot_key_sig)
         self.assertIsNone(
-            psbt._resolve_input_privkey(psbt.inputs[0], root, root.my_fingerprint)
+            resolve_input_privkey(
+                psbt.inputs[0], root, root.my_fingerprint, derive_hdkey
+            )
         )
 
     def test_foreign_derivation_not_signed(self):
