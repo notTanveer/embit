@@ -356,6 +356,31 @@ class SilentPaymentsPSBT(PSBT):
         inp.taproot_key_sig = sigdata
         return 1
 
+    def _match_sp_spend_base(self, inp, root, fingerprint):
+        """Return the base PrivateKey for a BIP-376 SP-spend input, matched via
+        ``sp_spend_bip32_derivations`` for ``fingerprint`` (or the raw ``root``
+        key when there's no fingerprint), or None if ``root`` does not control
+        this input's SP spend key.
+
+        Returns the *untweaked* base key -- callers apply ``sp_spend_tweak``
+        themselves, since the send path normalizes to even-Y for ECDH
+        summation while the spend/signing path leaves parity to Schnorr
+        signing.
+        """
+        if fingerprint:
+            for pub_bytes, derivation in inp.sp_spend_bip32_derivations.items():
+                if derivation.fingerprint != fingerprint:
+                    continue
+                hdkey = self._derive_hdkey(root, derivation)
+                if hdkey is None or hdkey.xonly() != pub_bytes[1:]:
+                    continue
+                return hdkey.key
+
+        if fingerprint is None and hasattr(root, "secret"):
+            return root
+
+        return None
+
     def _sign_sp_spends(self, root) -> int:
         """BIP-376: sign inputs that carry sp_tweak using sp_spend_bip32_derivations."""
         fingerprint, can_sign = self._signing_fingerprint(root)
@@ -369,21 +394,7 @@ class SilentPaymentsPSBT(PSBT):
             if inp.taproot_key_sig is not None:
                 continue
 
-            priv_key = None
-
-            if fingerprint:
-                for pub_bytes, derivation in inp.sp_spend_bip32_derivations.items():
-                    if derivation.fingerprint != fingerprint:
-                        continue
-                    hdkey = self._derive_hdkey(root, derivation)
-                    if hdkey is None or hdkey.xonly() != pub_bytes[1:]:
-                        continue
-                    priv_key = hdkey.key
-                    break
-
-            if priv_key is None and fingerprint is None and hasattr(root, "secret"):
-                priv_key = root
-
+            priv_key = self._match_sp_spend_base(inp, root, fingerprint)
             if priv_key is None:
                 continue
 
@@ -413,26 +424,15 @@ class SilentPaymentsPSBT(PSBT):
             # Matched via sp_spend_bip32_derivations rather than the BIP-86 path.
             sp_tweak = getattr(inp, "sp_tweak", None)
             if sp_tweak is not None:
-                spend_bases = []
-                if fingerprint:
-                    for pub_bytes, derivation in (
-                        inp.sp_spend_bip32_derivations.items()
-                    ):
-                        if derivation.fingerprint != fingerprint:
-                            continue
-                        hdkey = self._derive_hdkey(root, derivation)
-                        if hdkey is None or hdkey.xonly() != pub_bytes[1:]:
-                            continue
-                        spend_bases.append(hdkey.key)
-                if fingerprint is None and hasattr(root, "secret"):
-                    spend_bases.append(root)
-                for base in spend_bases:
-                    try:
-                        out_priv = base.sp_spend_tweak(sp_tweak).even_y()
-                    except (EmbitError, ValueError):
-                        continue
-                    if out_priv.xonly() == output_xonly:
-                        return out_priv.secret
+                base = self._match_sp_spend_base(inp, root, fingerprint)
+                if base is None:
+                    return None
+                try:
+                    out_priv = base.sp_spend_tweak(sp_tweak).even_y()
+                except (EmbitError, ValueError):
+                    return None
+                if out_priv.xonly() == output_xonly:
+                    return out_priv.secret
                 return None
 
             merkle = inp.taproot_merkle_root or b""

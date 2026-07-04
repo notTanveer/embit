@@ -207,22 +207,16 @@ def create_outputs(input_privkeys, outpoints, recipients):
         ec_pubkey_tweak_mul(ecdh_point, scalar_bytes)
         shared_secret = ec_pubkey_serialize(ecdh_point)
 
-        for k, (B_spend, addr) in enumerate(B_spend_list):
-            t_k = tagged_hash(
-                "BIP0352/SharedSecret",
-                shared_secret + k.to_bytes(4, "big"),
-            )
-
-            P_k = bytearray(ec_pubkey_parse(B_spend.sec()))
-            ec_pubkey_tweak_add(P_k, t_k)
-
-            xonly = ec_pubkey_serialize(P_k)[1:33]
-            result[addr].append(hexlify(xonly).decode())
+        outputs = derive_silent_payment_outputs(
+            shared_secret, [B_spend for B_spend, _addr in B_spend_list]
+        )
+        for k, (_B_spend, addr) in enumerate(B_spend_list):
+            result[addr].append(hexlify(outputs[k]).decode())
 
     return result
 
 
-def derive_silent_payment_outputs(ecdh_share, recipients):
+def derive_silent_payment_outputs(ecdh_share, spend_keys):
     """
     Derive silent payment outputs for recipients from a precomputed ECDH share.
 
@@ -230,33 +224,32 @@ def derive_silent_payment_outputs(ecdh_share, recipients):
     this takes the ECDH shared-secret point directly, as used by the BIP-375
     PSBT flow where shares are carried in the PSBT.
 
-    The spend key of each recipient is the final per-output spend key as carried
-    in PSBT_OUT_SP_V0_INFO (already label-tweaked when the address was labeled),
-    so no label tweak is applied here. ``k`` is the recipient's position in
-    ``recipients`` (the caller fixes the ordering).
+    Each spend key is the final per-output spend key as carried in
+    PSBT_OUT_SP_V0_INFO (already label-tweaked when the address was labeled),
+    so no label tweak is applied here. ``k`` is the key's position in
+    ``spend_keys`` (the caller fixes the ordering).
 
     Args:
         ecdh_share: 33-byte compressed shared-secret point, already multiplied
             by input_hash (validator does this before calling).
-        recipients: ordered list of (scan_key, spend_key, label) tuples; label
-            is informational and unused here.
+        spend_keys: ordered list of recipient spend public keys.
 
     Returns:
         Dict mapping recipient position k to output pubkey x-only (32 bytes).
     """
-    if not recipients:
+    if not spend_keys:
         return {}
 
-    if len(recipients) > K_MAX:
+    if len(spend_keys) > K_MAX:
         raise ValueError(
             "Too many outputs for one scan key: {} > {}".format(
-                len(recipients), K_MAX
+                len(spend_keys), K_MAX
             )
         )
 
     result = {}
 
-    for k, (scan_key, spend_key, _label) in enumerate(recipients):
+    for k, spend_key in enumerate(spend_keys):
         t_k = tagged_hash(
             "BIP0352/SharedSecret",
             ecdh_share + k.to_bytes(4, "big"),

@@ -403,7 +403,7 @@ def derive_sp_output_scripts(psbt, eligible=None) -> dict:
 
         derived = derive_silent_payment_outputs(
             adjusted_share,
-            [(o.sp_data.scan_key, o.sp_data.spend_key, o.sp_label) for _, o in group],
+            [o.sp_data.spend_key for _, o in group],
         )
         for pos, (out_idx, _out) in enumerate(group):
             resolved[out_idx] = Script(b"\x51\x20" + derived[pos])

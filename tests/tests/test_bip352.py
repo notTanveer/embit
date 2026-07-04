@@ -249,11 +249,11 @@ class BIP352Test(TestCase):
     def test_derive_outputs_rejects_too_many_outputs_per_scan_key(self):
         """Should fail when the per-scan-key recipient list exceeds K_MAX"""
         vector = BASIC_TEST_VECTORS[0]
-        B_scan, B_spend = bip352.decode_silent_payment_address(vector["sp_address"])
-        recipients = [(B_scan, B_spend, None)] * (bip352.K_MAX + 1)
+        _B_scan, B_spend = bip352.decode_silent_payment_address(vector["sp_address"])
+        spend_keys = [B_spend] * (bip352.K_MAX + 1)
 
         with pytest.raises(ValueError, match="Too many outputs"):
-            bip352.derive_silent_payment_outputs(b"\x02" + bytes(32), recipients)
+            bip352.derive_silent_payment_outputs(b"\x02" + bytes(32), spend_keys)
 
     def test_create_outputs_assigns_k_by_vout_order_when_interleaved(self):
         """Addresses sharing a scan key get k by recipients-list (vout) order,

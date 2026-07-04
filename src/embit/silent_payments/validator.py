@@ -59,7 +59,8 @@ class BIP375Validator:
 
         # Stage 2: ECDH Coverage
         try:
-            self._validate_ecdh_coverage()
+            eligible_inputs = get_eligible_inputs(self.psbt.inputs, has_sp_outputs=True)
+            self._validate_ecdh_coverage(eligible_inputs)
         except SPValidationError as e:
             raise SPValidationError("ECDH coverage validation failed: {}".format(e))
 
@@ -72,7 +73,7 @@ class BIP375Validator:
         # Stage 4: Output Scripts (optional)
         if not skip_output_scripts:
             try:
-                self._validate_output_scripts()
+                self._validate_output_scripts(eligible_inputs)
             except SPValidationError as e:
                 raise SPValidationError("Output script validation failed: {}".format(e))
 
@@ -121,7 +122,7 @@ class BIP375Validator:
                             "PSBT_OUT_SCRIPT is set for SP output".format(i)
                         )
 
-    def _validate_ecdh_coverage(self):
+    def _validate_ecdh_coverage(self, eligible_inputs):
         """
         Stage 2: ECDH Coverage validation.
 
@@ -130,8 +131,6 @@ class BIP375Validator:
         - DLEQ proofs exist and verify correctly
         - BIP32 derivations present when needed
         """
-        eligible_inputs = get_eligible_inputs(self.psbt.inputs, has_sp_outputs=True)
-
         for out_idx, out in enumerate(self.psbt.outputs):
             if out.sp_data is None:
                 continue  # Not an SP output
@@ -272,15 +271,11 @@ class BIP375Validator:
         Stage 3: Input Eligibility validation.
 
         Checks:
-        - No Segwit v>1 inputs with SP outputs
         - Only SIGHASH_ALL (if specified)
-        """
-        # Get eligible inputs - this will raise if Segwit v>1 found
-        try:
-            get_eligible_inputs(self.psbt.inputs, has_sp_outputs=True)
-        except SPValidationError as e:
-            raise SPValidationError("Invalid input for SP: {}".format(e))
 
+        Segwit v>1 rejection is enforced by validate()'s Stage 2
+        get_eligible_inputs() call, which always runs first.
+        """
         # Check sighash types
         for i, inp in enumerate(self.psbt.inputs):
             if inp.sighash_type is not None:
@@ -295,7 +290,7 @@ class BIP375Validator:
                         )
                     )
 
-    def _validate_output_scripts(self):
+    def _validate_output_scripts(self, eligible_inputs):
         """
         Stage 4: Output Scripts validation.
 
@@ -303,8 +298,6 @@ class BIP375Validator:
         - Verify script is correctly derived from SP data and ECDH shares
         - Verify sorting of outputs by scan/spend keys
         """
-        eligible_inputs = get_eligible_inputs(self.psbt.inputs, has_sp_outputs=True)
-
         eligible_pubkeys = [
             input_public_key(self.psbt.inputs[i]) for i in eligible_inputs
         ]
