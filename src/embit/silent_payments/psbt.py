@@ -13,7 +13,6 @@ from collections import OrderedDict
 from .. import ec
 from ..base import EmbitError
 from ..script import Script, Witness
-from ..transaction import COutPoint
 from ..psbt import (
     PSBT,
     DerivationPath,
@@ -29,14 +28,14 @@ from ..psbt import (
 from . import dleq
 from .ecdh import (
     _derive_outputs_for_keys,
+    all_outpoints,
     compute_ecdh_share,
     compute_dleq_proof,
-    compute_global_ecdh_share,
     compute_global_dleq_proof,
     derive_sp_output_scripts,
     get_eligible_inputs,
+    group_sp_outputs_by_scan_key,
     match_sp_spend_base,
-    pubkey_hash_from_script,
     input_public_key,
     resolve_input_privkey,
 )
@@ -476,16 +475,12 @@ class SilentPaymentsPSBT(PSBT):
         if not (self.version == 2 and self.has_sp_outputs):
             return self.sign_with(root)
 
+        groups = group_sp_outputs_by_scan_key(self.outputs)
         scan_spend_groups = {}
         output_indices = {}
-        for i, out in enumerate(self.outputs):
-            if out.sp_data is not None:
-                sk_bytes = out.sp_data.scan_key.sec()
-                if sk_bytes not in scan_spend_groups:
-                    scan_spend_groups[sk_bytes] = (out.sp_data.scan_key, [])
-                    output_indices[sk_bytes] = []
-                scan_spend_groups[sk_bytes][1].append(out.sp_data.spend_key)
-                output_indices[sk_bytes].append(i)
+        for sk_bytes, (scan_key, pairs) in groups.items():
+            scan_spend_groups[sk_bytes] = (scan_key, [spend_key for _, spend_key in pairs])
+            output_indices[sk_bytes] = [out_idx for out_idx, _ in pairs]
 
         eligible = get_eligible_inputs(self.inputs, has_sp_outputs=True)
         if not eligible:
@@ -524,10 +519,7 @@ class SilentPaymentsPSBT(PSBT):
             inp.sp_ecdh_shares.clear()
             inp.sp_dleq_proofs.clear()
 
-        outpoints = [
-            COutPoint(txid=self.tx.vin[i].txid, out_idx=self.tx.vin[i].vout)
-            for i in range(len(self.inputs))
-        ]
+        outpoints = all_outpoints(self)
 
         derivation = _derive_outputs_for_keys(
             priv_keys, outpoints, scan_spend_groups

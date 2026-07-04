@@ -68,6 +68,13 @@ def _normalize_xonly_keys(input_privkeys):
     return normalized
 
 
+def _tweak_mul(point_sec: bytes, scalar: bytes) -> bytes:
+    """Multiply a compressed point by a scalar, returning the compressed result."""
+    point = bytearray(ec_pubkey_parse(point_sec))
+    ec_pubkey_tweak_mul(point, scalar)
+    return ec_pubkey_serialize(point, EC_COMPRESSED)
+
+
 def compute_ecdh_share(private_key: bytes, scan_key: ec.PublicKey) -> bytes:
     """
     Compute ECDH share for a single private key.
@@ -82,10 +89,7 @@ def compute_ecdh_share(private_key: bytes, scan_key: ec.PublicKey) -> bytes:
     if len(private_key) != 32:
         raise SPFieldError("Private key must be 32 bytes")
 
-    # Compute a·B_scan
-    b_internal = bytearray(ec_pubkey_parse(scan_key.sec()))
-    ec_pubkey_tweak_mul(b_internal, private_key)
-    return ec_pubkey_serialize(b_internal, EC_COMPRESSED)
+    return _tweak_mul(scan_key.sec(), private_key)
 
 
 def compute_global_ecdh_share(private_keys, scan_key: ec.PublicKey):
@@ -111,9 +115,7 @@ def compute_global_ecdh_share(private_keys, scan_key: ec.PublicKey):
         return None
 
     a_sum_bytes = a_sum.to_bytes(32, "big")
-    b_internal = bytearray(ec_pubkey_parse(scan_key.sec()))
-    ec_pubkey_tweak_mul(b_internal, a_sum_bytes)
-    return ec_pubkey_serialize(b_internal, EC_COMPRESSED)
+    return _tweak_mul(scan_key.sec(), a_sum_bytes)
 
 
 def compute_dleq_proof(
@@ -196,9 +198,7 @@ def compute_global_dleq_proof(
         # Verify global_share against the already-summed a_sum instead of
         # calling compute_global_ecdh_share() again (which would re-sum
         # private_keys).
-        b_internal = bytearray(ec_pubkey_parse(scan_key.sec()))
-        ec_pubkey_tweak_mul(b_internal, a_sum_bytes)
-        if ec_pubkey_serialize(b_internal, EC_COMPRESSED) != global_share:
+        if _tweak_mul(scan_key.sec(), a_sum_bytes) != global_share:
             raise SPFieldError(
                 "global_share does not match private_keys and scan_key"
             )
@@ -458,10 +458,32 @@ def sum_pubkeys(pubkeys) -> bytes:
     return ec_pubkey_serialize(acc, EC_COMPRESSED)
 
 
-def _apply_input_hash(ecdh_share, input_hash):
-    adjusted = bytearray(ec_pubkey_parse(ecdh_share))
-    ec_pubkey_tweak_mul(adjusted, input_hash)
-    return ec_pubkey_serialize(adjusted, EC_COMPRESSED)
+def all_outpoints(psbt):
+    """Return the COutPoint list for every input of a PSBT-like object
+    (has .tx and .inputs), in input order."""
+    return [
+        COutPoint(txid=psbt.tx.vin[i].txid, out_idx=psbt.tx.vin[i].vout)
+        for i in range(len(psbt.inputs))
+    ]
+
+
+def group_sp_outputs_by_scan_key(outputs):
+    """Group SP outputs by scan key, preserving output-index order.
+
+    Returns {scan_key_bytes: (scan_key, [(out_idx, spend_key), ...])}. The
+    derivation counter k is the output's position within its scan-key group
+    in this order (BIP-375: outputs sharing scan+spend are ordered by output
+    index).
+    """
+    groups = {}
+    for out_idx, out in enumerate(outputs):
+        if out.sp_data is None:
+            continue
+        sk_bytes = out.sp_data.scan_key.sec()
+        if sk_bytes not in groups:
+            groups[sk_bytes] = (out.sp_data.scan_key, [])
+        groups[sk_bytes][1].append((out_idx, out.sp_data.spend_key))
+    return groups
 
 
 def derive_sp_output_scripts(psbt, eligible=None, eligible_pubkeys=None) -> dict:
@@ -487,8 +509,8 @@ def derive_sp_output_scripts(psbt, eligible=None, eligible_pubkeys=None) -> dict
         input's public key can't be recovered (a partial sum would derive
         wrong scripts, not just incomplete ones).
     """
-    sp_outputs = [(i, o) for i, o in enumerate(psbt.outputs) if o.sp_data is not None]
-    if not sp_outputs:
+    groups = group_sp_outputs_by_scan_key(psbt.outputs)
+    if not groups:
         return {}
 
     if eligible is None:
@@ -503,23 +525,12 @@ def derive_sp_output_scripts(psbt, eligible=None, eligible_pubkeys=None) -> dict
 
     # BIP-352 input_hash commits to the smallest outpoint over ALL transaction
     # inputs (not just the eligible ones), while A is the sum of eligible keys.
-    outpoints = [
-        COutPoint(txid=psbt.tx.vin[i].txid, out_idx=psbt.tx.vin[i].vout)
-        for i in range(len(psbt.inputs))
-    ]
+    outpoints = all_outpoints(psbt)
     A_sum_bytes = sum_pubkeys(eligible_pubkeys)
     input_hash = get_input_hash(outpoints, A_sum_bytes)
 
-    # Group SP outputs by scan key, preserving output-index order. The
-    # derivation counter k is the output's position within its scan-key
-    # group in this order (BIP-375: outputs sharing scan+spend are ordered
-    # by output index).
-    groups = {}
-    for out_idx, out in sp_outputs:
-        groups.setdefault(out.sp_data.scan_key.sec(), []).append((out_idx, out))
-
     resolved = {}
-    for scan_key_bytes, group in groups.items():
+    for scan_key_bytes, (_scan_key, group) in groups.items():
         ecdh_share = psbt.sp_ecdh_shares.get(scan_key_bytes)
         if ecdh_share is None:
             # No global share yet - sum per-input shares (requires every
@@ -537,13 +548,13 @@ def derive_sp_output_scripts(psbt, eligible=None, eligible_pubkeys=None) -> dict
                 continue
             ecdh_share = ec_pubkey_serialize(share_sum, EC_COMPRESSED)
 
-        adjusted_share = _apply_input_hash(ecdh_share, input_hash)
+        adjusted_share = _tweak_mul(ecdh_share, input_hash)
 
         derived = derive_silent_payment_outputs(
             adjusted_share,
-            [o.sp_data.spend_key for _, o in group],
+            [spend_key for _, spend_key in group],
         )
-        for pos, (out_idx, _out) in enumerate(group):
+        for pos, (out_idx, _spend_key) in enumerate(group):
             resolved[out_idx] = Script(b"\x51\x20" + derived[pos])
 
     return resolved
@@ -576,7 +587,7 @@ def _derive_outputs_for_keys(priv_keys, outpoints, scan_spend_groups):
     results = {}
     for sk_bytes, (scan_key, spend_keys) in scan_spend_groups.items():
         ecdh_share = compute_ecdh_share(a_sum_bytes, scan_key)
-        adjusted_share = _apply_input_hash(ecdh_share, input_hash)
+        adjusted_share = _tweak_mul(ecdh_share, input_hash)
         outputs = derive_silent_payment_outputs(adjusted_share, spend_keys)
         results[sk_bytes] = (ecdh_share, outputs)
 
