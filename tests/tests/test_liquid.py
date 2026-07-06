@@ -2,6 +2,7 @@
 from unittest import TestCase, skipUnless
 from embit.util import secp256k1
 from binascii import unhexlify
+from embit.liquid.addresses import address
 from embit.liquid.pset import PSET, LInputScope
 from embit.psbt import PSBTError
 from embit.liquid.psetview import PSETView
@@ -363,3 +364,7 @@ class LiquidTest(TestCase):
         res = vout.unblind(bkey.secret, message_length=200)
         value, asset, vbf, abf, extramsg, min_value, max_value = res
         self.assertEqual(extramsg[: len(msg)], msg)
+
+    def test_address_of_non_witness_script(self):
+        # OP_RETURN is not a witness program, so there is no address for it
+        self.assertIsNone(address(Script(b"\x6a\x04test")))
