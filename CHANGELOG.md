@@ -25,6 +25,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   encodings, as Bitcoin Core does.
 - `PSBTView` hashes prevouts, sequences and outputs in a single pass and
   caches the per-input utxo data used by taproot sighashes.
+- A scope's PSBT version is now scope state (`PSBTScope.version`, set from
+  `read_from`) instead of a `version=` argument threaded through
+  `read_value`, so `read_value(self, stream, key)` keeps the signature that
+  subclasses outside this repo override.
+- `PSBT.version` is `0` (not `None`) for a PSBT that carries an explicit
+  `PSBT_GLOBAL_VERSION` of 0, so the field survives a round trip. Both still
+  mean v0 everywhere else, and an absent field stays `None`.
+- Dropped `PSBT.get_tx_modifiable`/`set_tx_modifiable` (assign
+  `tx_modifiable_flags` directly) and the unused `_write_extra_globals` hook.
+  `EmbitBase.parse` now raises `cls.PARSE_ERROR`, which `PSBT` sets to
+  `PSBTError`, replacing its copy of `parse`.
 
 ### Fixed
 
@@ -51,6 +62,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   taking the zero input count for a segwit marker (#117).
 - `PSET` v2 outputs without an asset or asset commitment are rejected at parse
   time instead of failing with `TypeError` when hashed.
+- `PSBT_IN_TAP_BIP32_DERIVATION`/`PSBT_OUT_TAP_BIP32_DERIVATION` built the
+  leaf hash list before checking any length, so a 5-byte value could make the
+  parser allocate a multi-GB list and die with `MemoryError` instead of
+  `PSBTError`. The count is now bounded by the value's own length.
+- Duplicate keys in an input or output map are rejected in every
+  `CompressMode`. Only `KEEP_ALL` caught them before, because the compressed
+  parse drops most fields instead of storing them, so their per-field
+  duplicate checks never fired. A duplicate taproot derivation key was
+  silently ignored in all modes.
+- `PSBT_IN_OUTPUT_INDEX` pointing past the end of the input's non-witness
+  UTXO raised a bare `IndexError` from `InputScope.utxo` (and so from
+  `script_pubkey`, `is_taproot` and `fee()`) under the default `KEEP_ALL`;
+  the compressed modes already rejected it at parse time.
+- `PSBT_IN_REQUIRED_TIME_LOCKTIME`/`PSBT_IN_REQUIRED_HEIGHT_LOCKTIME` were
+  range-checked on read but not on write, so `PSBT` could emit a PSBT it
+  refused to parse back and `determine_locktime()` could return a height
+  above `LOCKTIME_THRESHOLD` that consensus reads as a timestamp.
 
 ## [0.8.2] - 2026-08-08
 

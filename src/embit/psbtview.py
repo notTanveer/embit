@@ -29,9 +29,12 @@ from .psbt import (
     CompressMode,
     InputScope,
     OutputScope,
-    LOCKTIME_THRESHOLD,
+    check_height_locktime,
+    check_time_locktime,
     choose_locktime,
+    derive_hdkey,
     next_tx_modifiable,
+    resolve_signing_root,
     read_string,
     ser_string,
     skip_string,
@@ -368,8 +371,8 @@ class PSBTView:
         first_scope = cur
         if version not in (None, 0, 2):
             raise PSBTError("Unsupported PSBT_GLOBAL_VERSION value: %d" % version)
-        if version == 0:
-            version = None
+        # 0 (explicit) and None (absent) both mean v0 to every "== 2" check
+        # below; keeping them apart is what lets PSBT re-emit the field
         # PSBTv2 must not have a global unsigned transaction, regardless of key order
         if tx_offset is not None and version == 2:
             raise PSBTError("Global transaction with version 2 PSBT")
@@ -672,23 +675,16 @@ class PSBTView:
             if v_height is not None:
                 if len(v_height) != 4:
                     raise PSBTError("PSBT_IN_REQUIRED_HEIGHT_LOCKTIME must be 4 bytes")
-                height_locktime = int.from_bytes(v_height, "little")
-                if height_locktime == 0 or height_locktime >= LOCKTIME_THRESHOLD:
-                    raise PSBTError(
-                        "Height-based locktime must be > 0 and < %d"
-                        % LOCKTIME_THRESHOLD
-                    )
-                height_locktimes.append(height_locktime)
+                height_locktimes.append(
+                    check_height_locktime(int.from_bytes(v_height, "little"))
+                )
                 has_requirement = True
             if v_time is not None:
                 if len(v_time) != 4:
                     raise PSBTError("PSBT_IN_REQUIRED_TIME_LOCKTIME must be 4 bytes")
-                time_locktime = int.from_bytes(v_time, "little")
-                if time_locktime < LOCKTIME_THRESHOLD:
-                    raise PSBTError(
-                        "Time-based locktime must be >= %d" % LOCKTIME_THRESHOLD
-                    )
-                time_locktimes.append(time_locktime)
+                time_locktimes.append(
+                    check_time_locktime(int.from_bytes(v_time, "little"))
+                )
                 has_requirement = True
             if has_requirement:
                 inputs_with_requirements += 1
@@ -1035,18 +1031,9 @@ class PSBTView:
             raise PSBTError("Invalid input number")
 
         # if WIF - fingerprint is None
-        fingerprint = None
-        # if descriptor key
-        if hasattr(root, "origin"):
-            if not root.is_private:  # pubkey can't sign
-                return 0
-            if root.is_extended:  # use fingerprint only for HDKey
-                fingerprint = root.fingerprint
-            else:
-                root = root.key  # WIF key
-        # if HDKey
-        if not fingerprint and hasattr(root, "my_fingerprint"):
-            fingerprint = root.my_fingerprint
+        fingerprint, can_sign, root = resolve_signing_root(root)
+        if not can_sign:  # pubkey can't sign
+            return 0
 
         rootpub = root.get_public_key()
         sec = rootpub.sec()
@@ -1099,17 +1086,10 @@ class PSBTView:
         # get derived keys for signing
         derived_keypairs = OrderedDict()  # (prv, pub)
         for pub, derivation in bip32_derivations:
-            der = derivation.derivation
-            # descriptor key has origin derivation that we take into account
-            if hasattr(root, "origin"):
-                if root.origin:
-                    if root.origin.derivation != der[: len(root.origin.derivation)]:
-                        # derivation doesn't match - go to next input
-                        continue
-                    der = der[len(root.origin.derivation) :]
-                hdkey = root.key.derive(der)
-            else:
-                hdkey = root.derive(der)
+            hdkey = derive_hdkey(root, derivation)
+            if hdkey is None:
+                # derivation doesn't match the origin prefix - go to next input
+                continue
 
             if hdkey.xonly() != pub.xonly():
                 raise PSBTError("Derivation path doesn't look right")

@@ -192,6 +192,22 @@ def derive_hdkey(root, derivation):
     return root.derive(der)
 
 
+def check_height_locktime(locktime):
+    """Range check for PSBT_IN_REQUIRED_HEIGHT_LOCKTIME, on both read and write."""
+    if locktime == 0 or locktime >= LOCKTIME_THRESHOLD:
+        raise PSBTError(
+            "Height-based locktime must be > 0 and < %d" % LOCKTIME_THRESHOLD
+        )
+    return locktime
+
+
+def check_time_locktime(locktime):
+    """Range check for PSBT_IN_REQUIRED_TIME_LOCKTIME, on both read and write."""
+    if locktime < LOCKTIME_THRESHOLD:
+        raise PSBTError("Time-based locktime must be >= %d" % LOCKTIME_THRESHOLD)
+    return locktime
+
+
 def choose_locktime(
     height_locktimes, time_locktimes, num_with_requirements, fallback=0
 ):
@@ -242,7 +258,11 @@ class PSBTScope(EmbitBase):
 
     def __init__(self, unknown: dict = None, version=None):
         self.unknown = {} if unknown is None else unknown
-        self.parse_unknowns(version)
+        # read_value() needs the version to tell a v2 field from an unknown key.
+        # Kept as state so read_value(stream, key) stays the signature subclasses
+        # outside this repo already override.
+        self.version = version
+        self.parse_unknowns()
 
     def write_to(self, stream, skip_separator=False, **kwargs) -> int:
         # unknown
@@ -255,19 +275,19 @@ class PSBTScope(EmbitBase):
             r += stream.write(b"\x00")
         return r
 
-    def parse_unknowns(self, version=None):
+    def parse_unknowns(self):
         # go through all the unknowns and parse them: known keys land in their
         # fields, the rest is put back into self.unknown by read_value()
         for k in list(self.unknown):
             s = BytesIO()
             ser_string(s, self.unknown.pop(k))
             s.seek(0)
-            self._read_value_checked(s, k, version=version)
+            self._read_value_checked(s, k)
 
-    def _read_value_checked(self, stream, key, version=None):
+    def _read_value_checked(self, stream, key):
         """read_value() that reports malformed nested data as PSBTError."""
         try:
-            self.read_value(stream, key, version=version)
+            self.read_value(stream, key)
         except PSBTError:
             raise
         except _PARSE_ERRORS as e:
@@ -278,7 +298,7 @@ class PSBTScope(EmbitBase):
         if len(key) != 1 and key[:1] in cls.V2_FIELDS:
             raise PSBTError("Invalid PSBTv2 field key")
 
-    def read_value(self, stream, key, version=None):
+    def read_value(self, stream, key):
         # separator
         if len(key) == 0:
             return
@@ -291,18 +311,37 @@ class PSBTScope(EmbitBase):
     def update(self, other):
         self.unknown.update(other.unknown)
 
+    @staticmethod
+    def _read_map(res, stream):
+        """Read one scope map into `res`, up to and including its separator."""
+        seen = set()
+        while True:
+            key = read_string(stream)
+            # separator
+            if len(key) == 0:
+                break
+            # dispatch first so the per-field checks can raise their own message,
+            # then catch what they can't: in compress mode most fields are dropped
+            # instead of stored, so their duplicate checks never fire
+            res._read_value_checked(stream, key)
+            if key in seen:
+                raise PSBTError("Duplicated key %s" % hexlify(key).decode())
+            seen.add(key)
+
     @classmethod
     def read_from(cls, stream, *args, **kwargs):
-        version = kwargs.pop("version", None)
         res = cls({}, *args, **kwargs)
         while True:
             key = read_string(stream)
             # separator
             if len(key) == 0:
                 break
-            if version != 2 and key in res.V2_FIELDS:
+            # InputScope/OutputScope override read_from and reject V2 fields
+            # per-field in read_value; this is for subclasses that only declare
+            # V2_FIELDS and inherit the loop
+            if res.version != 2 and key in res.V2_FIELDS:
                 raise PSBTError("PSBTv2 field is not allowed in PSBTv0")
-            res._read_value_checked(stream, key, version=version)
+            res._read_value_checked(stream, key)
         return res
 
 
@@ -417,13 +456,17 @@ class InputScope(PSBTScope):
 
     @property
     def utxo(self):
-        return (
-            self._utxo
-            or self.witness_utxo
-            or (
-                self.non_witness_utxo.vout[self.vout] if self.non_witness_utxo else None
+        utxo = self._utxo or self.witness_utxo
+        if utxo or not self.non_witness_utxo:
+            return utxo
+        # the compressed parse checks this via read_vout, but with KEEP_ALL the
+        # output index is never validated against the utxo we hold
+        if self.vout is None or self.vout >= len(self.non_witness_utxo.vout):
+            raise PSBTError(
+                "Invalid vout index %s, max is %d"
+                % (self.vout, len(self.non_witness_utxo.vout) - 1)
             )
-        )
+        return self.non_witness_utxo.vout[self.vout]
 
     @property
     def script_pubkey(self):
@@ -461,7 +504,7 @@ class InputScope(PSBTScope):
             raise PSBTError("Missing non_witness_utxo")
         return False
 
-    def read_value(self, stream, k, version=None):
+    def read_value(self, stream, k):
         # separator
         if len(k) == 0:
             return
@@ -577,7 +620,7 @@ class InputScope(PSBTScope):
 
         # PSBTv2 fields
         elif k == b"\x0e":
-            if version != 2:
+            if self.version != 2:
                 raise PSBTError("PSBT_IN_PREVIOUS_TXID not allowed in PSBTv0")
             if len(v) != 32:
                 raise PSBTError("PSBT_IN_PREVIOUS_TXID must be 32 bytes")
@@ -585,7 +628,7 @@ class InputScope(PSBTScope):
                 raise PSBTError("Duplicated PSBT_IN_PREVIOUS_TXID")
             self.txid = bytes(reversed(v))
         elif k == b"\x0f":
-            if version != 2:
+            if self.version != 2:
                 raise PSBTError("PSBT_IN_OUTPUT_INDEX not allowed in PSBTv0")
             if len(v) != 4:
                 raise PSBTError("PSBT_IN_OUTPUT_INDEX must be 4 bytes")
@@ -593,7 +636,7 @@ class InputScope(PSBTScope):
                 raise PSBTError("Duplicated PSBT_IN_OUTPUT_INDEX")
             self.vout = int.from_bytes(v, "little")
         elif k == b"\x10":
-            if version != 2:
+            if self.version != 2:
                 raise PSBTError("PSBT_IN_SEQUENCE not allowed in PSBTv0")
             if len(v) != 4:
                 raise PSBTError("PSBT_IN_SEQUENCE must be 4 bytes")
@@ -603,22 +646,19 @@ class InputScope(PSBTScope):
 
         # PSBT_IN_REQUIRED_TIME_LOCKTIME
         elif k == b"\x11":
-            if version != 2:
+            if self.version != 2:
                 raise PSBTError("PSBT_IN_REQUIRED_TIME_LOCKTIME not allowed in PSBTv0")
             if self.required_time_locktime is not None:
                 raise PSBTError("Duplicated required time locktime")
             if len(v) != 4:
                 raise PSBTError("PSBT_IN_REQUIRED_TIME_LOCKTIME must be 4 bytes")
-            locktime = int.from_bytes(v, "little")
-            if locktime < LOCKTIME_THRESHOLD:
-                raise PSBTError(
-                    "Time-based locktime must be >= %d" % LOCKTIME_THRESHOLD
-                )
-            self.required_time_locktime = locktime
+            self.required_time_locktime = check_time_locktime(
+                int.from_bytes(v, "little")
+            )
 
         # PSBT_IN_REQUIRED_HEIGHT_LOCKTIME
         elif k == b"\x12":
-            if version != 2:
+            if self.version != 2:
                 raise PSBTError(
                     "PSBT_IN_REQUIRED_HEIGHT_LOCKTIME not allowed in PSBTv0"
                 )
@@ -626,12 +666,9 @@ class InputScope(PSBTScope):
                 raise PSBTError("Duplicated required height locktime")
             if len(v) != 4:
                 raise PSBTError("PSBT_IN_REQUIRED_HEIGHT_LOCKTIME must be 4 bytes")
-            locktime = int.from_bytes(v, "little")
-            if locktime >= LOCKTIME_THRESHOLD or locktime == 0:
-                raise PSBTError(
-                    "Height-based locktime must be > 0 and < %d" % LOCKTIME_THRESHOLD
-                )
-            self.required_height_locktime = locktime
+            self.required_height_locktime = check_height_locktime(
+                int.from_bytes(v, "little")
+            )
 
         # PSBT_IN_TAP_KEY_SIG
         elif k[0] == 0x13:
@@ -662,14 +699,17 @@ class InputScope(PSBTScope):
         # PSBT_IN_TAP_BIP32_DERIVATION
         elif k[0] == 0x16:
             pub = ec.PublicKey.from_xonly(k[1:])
-            if pub not in self.taproot_bip32_derivations:
-                b = BytesIO(v)
-                num_leaf_hashes = read_compact(b)
-                leaf_hashes = [b.read(32) for i in range(num_leaf_hashes)]
-                if not all([len(leaf) == 32 for leaf in leaf_hashes]):
-                    raise PSBTError("Invalid length of taproot leaf hashes")
-                der = DerivationPath.read_from(b)
-                self.taproot_bip32_derivations[pub] = (leaf_hashes, der)
+            if pub in self.taproot_bip32_derivations:
+                raise PSBTError("Duplicated taproot derivation path")
+            b = BytesIO(v)
+            num_leaf_hashes = read_compact(b)
+            # bound the count by the bytes the value actually holds, otherwise a
+            # 5-byte value makes us allocate a multi-GB list before we reject it
+            if num_leaf_hashes * 32 > len(v) - b.tell():
+                raise PSBTError("Invalid length of taproot leaf hashes")
+            leaf_hashes = [b.read(32) for i in range(num_leaf_hashes)]
+            der = DerivationPath.read_from(b)
+            self.taproot_bip32_derivations[pub] = (leaf_hashes, der)
 
         # PSBT_IN_TAP_INTERNAL_KEY
         elif k[0] == 0x17:
@@ -729,7 +769,7 @@ class InputScope(PSBTScope):
                 r += _ser_uint(
                     stream,
                     b"\x11",
-                    self.required_time_locktime,
+                    check_time_locktime(self.required_time_locktime),
                     4,
                     "PSBT_IN_REQUIRED_TIME_LOCKTIME",
                 )
@@ -737,7 +777,7 @@ class InputScope(PSBTScope):
                 r += _ser_uint(
                     stream,
                     b"\x12",
-                    self.required_height_locktime,
+                    check_height_locktime(self.required_height_locktime),
                     4,
                     "PSBT_IN_REQUIRED_HEIGHT_LOCKTIME",
                 )
@@ -789,7 +829,7 @@ class InputScope(PSBTScope):
 
     @classmethod
     def read_from(cls, stream, compress=CompressMode.KEEP_ALL, vin=None, version=None):
-        res = cls({}, vin=vin, compress=compress)
+        res = cls({}, vin=vin, compress=compress, version=version)
         # PSBT maps are unordered, so PSBTv2 input maps may provide the output
         # index after the non-witness UTXO. Peek only at compact-sized keys and
         # skip values to keep compressed parsing independent of key order.
@@ -816,12 +856,7 @@ class InputScope(PSBTScope):
                         break
                     skip_string(stream)
                 stream.seek(start_pos)
-        while True:
-            key = read_string(stream)
-            # separator
-            if len(key) == 0:
-                break
-            res._read_value_checked(stream, key, version=version)
+        cls._read_map(res, stream)
         del res._prescan_vout
         return res
 
@@ -876,7 +911,7 @@ class OutputScope(PSBTScope):
     def vout(self):
         return TransactionOutput(self.value, self.script_pubkey)
 
-    def read_value(self, stream, k, version=None):
+    def read_value(self, stream, k):
         # separator
         if len(k) == 0:
             return
@@ -910,7 +945,7 @@ class OutputScope(PSBTScope):
 
         # PSBTv2 fields
         elif k == b"\x03":
-            if version != 2:
+            if self.version != 2:
                 raise PSBTError("PSBT_OUT_AMOUNT not allowed in PSBTv0")
             if len(v) != 8:
                 raise PSBTError("PSBT_OUT_AMOUNT must be 8 bytes")
@@ -921,7 +956,7 @@ class OutputScope(PSBTScope):
             if self.value >= 2**63:
                 raise PSBTError("PSBT_OUT_AMOUNT must be non-negative")
         elif k == b"\x04":
-            if version != 2:
+            if self.version != 2:
                 raise PSBTError("PSBT_OUT_SCRIPT not allowed in PSBTv0")
             if self.script_pubkey is not None:
                 raise PSBTError("Duplicated PSBT_OUT_SCRIPT")
@@ -934,14 +969,17 @@ class OutputScope(PSBTScope):
         # PSBT_OUT_TAP_BIP32_DERIVATION
         elif k[0] == 0x07:
             pub = ec.PublicKey.from_xonly(k[1:])
-            if pub not in self.taproot_bip32_derivations:
-                b = BytesIO(v)
-                num_leaf_hashes = read_compact(b)
-                leaf_hashes = [b.read(32) for i in range(num_leaf_hashes)]
-                if not all([len(leaf) == 32 for leaf in leaf_hashes]):
-                    raise PSBTError("Invalid length of taproot leaf hashes")
-                der = DerivationPath.read_from(b)
-                self.taproot_bip32_derivations[pub] = (leaf_hashes, der)
+            if pub in self.taproot_bip32_derivations:
+                raise PSBTError("Duplicated taproot derivation path")
+            b = BytesIO(v)
+            num_leaf_hashes = read_compact(b)
+            # bound the count by the bytes the value actually holds, otherwise a
+            # 5-byte value makes us allocate a multi-GB list before we reject it
+            if num_leaf_hashes * 32 > len(v) - b.tell():
+                raise PSBTError("Invalid length of taproot leaf hashes")
+            leaf_hashes = [b.read(32) for i in range(num_leaf_hashes)]
+            der = DerivationPath.read_from(b)
+            self.taproot_bip32_derivations[pub] = (leaf_hashes, der)
 
         else:
             if k in self.unknown:
@@ -997,13 +1035,8 @@ class OutputScope(PSBTScope):
 
     @classmethod
     def read_from(cls, stream, compress=CompressMode.KEEP_ALL, vout=None, version=None):
-        res = cls({}, vout=vout, compress=compress)
-        while True:
-            key = read_string(stream)
-            # separator
-            if len(key) == 0:
-                break
-            res._read_value_checked(stream, key, version=version)
+        res = cls({}, vout=vout, compress=compress, version=version)
+        cls._read_map(res, stream)
         return res
 
 
@@ -1029,6 +1062,7 @@ def next_tx_modifiable(flags, inp_sighash: int) -> int:
 
 class PSBT(EmbitBase):
     MAGIC = b"psbt\xff"
+    PARSE_ERROR = PSBTError
     # for subclasses
     PSBTIN_CLS = InputScope
     PSBTOUT_CLS = OutputScope
@@ -1101,10 +1135,12 @@ class PSBT(EmbitBase):
         for inp in inputs:
             has_requirement = False
             if inp.required_height_locktime is not None:
-                height_locktimes.append(inp.required_height_locktime)
+                height_locktimes.append(
+                    check_height_locktime(inp.required_height_locktime)
+                )
                 has_requirement = True
             if inp.required_time_locktime is not None:
-                time_locktimes.append(inp.required_time_locktime)
+                time_locktimes.append(check_time_locktime(inp.required_time_locktime))
                 has_requirement = True
             if has_requirement:
                 inputs_with_requirements += 1
@@ -1165,18 +1201,12 @@ class PSBT(EmbitBase):
             return self.inputs[i].utxo
         if not (self.inputs[i].witness_utxo or self.inputs[i].non_witness_utxo):
             raise PSBTError("Missing previous utxo on input %d" % i)
-        return (
-            self.inputs[i].witness_utxo
-            or self.inputs[i].non_witness_utxo.vout[self.inputs[i].vout]
-        )
+        return self.inputs[i].witness_utxo or self.inputs[i].utxo
 
     def fee(self):
         fee = sum([self.utxo(i).value for i in range(len(self.inputs))])
         fee -= sum([out.value for out in self.tx.vout])
         return fee
-
-    def _write_extra_globals(self, stream) -> int:
-        return 0
 
     def write_to(self, stream) -> int:
         # magic bytes
@@ -1212,8 +1242,9 @@ class PSBT(EmbitBase):
                     "PSBT_GLOBAL_TX_MODIFIABLE",
                 )
             r += _ser_uint(stream, b"\xfb", self.version, 4, "PSBT_GLOBAL_VERSION")
+        elif self.version == 0:
+            r += _ser_uint(stream, b"\xfb", 0, 4, "PSBT_GLOBAL_VERSION")
 
-        r += self._write_extra_globals(stream)
         # unknown
         for key in self.unknown:
             r += ser_string(stream, key)
@@ -1227,14 +1258,6 @@ class PSBT(EmbitBase):
         for out in self.outputs:
             r += out.write_to(stream, version=self.version)
         return r
-
-    @classmethod
-    def parse(cls, s: bytes, *args, **kwargs):
-        stream = BytesIO(s)
-        res = cls.read_from(stream, *args, **kwargs)
-        if len(stream.read(1)) > 0:
-            raise PSBTError("Unexpected extra bytes")
-        return res
 
     @classmethod
     def from_base64(cls, b64, compress=CompressMode.KEEP_ALL):
@@ -1287,9 +1310,10 @@ class PSBT(EmbitBase):
             if parsed_version == 2:
                 version = 2
             elif parsed_version == 0:
-                version = (
-                    None  # explicit PSBT_GLOBAL_VERSION=0 is valid for v0 per BIP174
-                )
+                # explicit PSBT_GLOBAL_VERSION=0 is valid for v0 per BIP174.
+                # 0 and None both mean v0 to every "== 2" check below, but only
+                # 0 makes write_to emit the field again.
+                version = 0
             else:
                 raise PSBTError(
                     "Unsupported PSBT_GLOBAL_VERSION value: %d" % parsed_version
@@ -1680,14 +1704,6 @@ class PSBT(EmbitBase):
         self.tx_modifiable_flags = next_tx_modifiable(
             self.tx_modifiable_flags, inp_sighash
         )
-
-    def get_tx_modifiable(self):
-        return self.tx_modifiable_flags
-
-    def set_tx_modifiable(self, flags):
-        if self.version != 2:
-            raise PSBTError("GLOBAL_TX_MODIFIABLE only supported in PSBTv2")
-        self.tx_modifiable_flags = flags
 
     def is_inputs_modifiable(self):
         if self.version != 2:

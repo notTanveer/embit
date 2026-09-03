@@ -1,4 +1,5 @@
 """Base classes"""
+
 from io import BytesIO
 from binascii import hexlify, unhexlify
 
@@ -10,6 +11,10 @@ class EmbitError(Exception):
 
 
 class EmbitBase:
+    # subclasses that have their own error type override this so parse()
+    # reports it instead of a bare EmbitError
+    PARSE_ERROR = EmbitError
+
     @classmethod
     def read_from(cls, stream, *args, **kwargs):
         """All classes should be readable from stream"""
@@ -23,7 +28,7 @@ class EmbitBase:
         stream = BytesIO(s)
         res = cls.read_from(stream, *args, **kwargs)
         if len(stream.read(1)) > 0:
-            raise EmbitError("Unexpected extra bytes")
+            raise cls.PARSE_ERROR("Unexpected extra bytes")
         return res
 
     def write_to(self, stream, *args, **kwargs) -> int:

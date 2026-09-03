@@ -138,10 +138,10 @@ class LInputScope(InputScope):
             witness=TxInWitness(self.issue_rangeproof, self.token_rangeproof),
         )
 
-    def read_value(self, stream, k, version=None):
+    def read_value(self, stream, k):
         # standard bitcoin stuff
         if (b"\xfc\x08elements" not in k) and (b"\xfc\x04pset" not in k):
-            super().read_value(stream, k, version=version)
+            super().read_value(stream, k)
         elif k == b"\xfc\x04pset\x0e":
             # range proof is very large,
             # so we don't load it if compress flag is set.
@@ -386,9 +386,9 @@ class LOutputScope(OutputScope):
             secp256k1.generator_parse(self.asset_commitment),
         )
 
-    def read_value(self, stream, k, version=None):
+    def read_value(self, stream, k):
         if (b"\xfc\x08elements" not in k) and (b"\xfc\x04pset" not in k):
-            super().read_value(stream, k, version=version)
+            super().read_value(stream, k)
         # range proof and surjection proof are very large,
         # so we don't load them if compress flag is set.
         elif k in [b"\xfc\x08elements\x04", b"\xfc\x04pset\x04"]:

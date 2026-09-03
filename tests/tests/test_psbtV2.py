@@ -1376,8 +1376,12 @@ class TestSequenceZero:
 
 
 class TestBaseScopeVersion:
-    def test_base_read_from_passes_version_to_read_value(self):
-        """A scope built on PSBTScope.read_from must see the PSBT version."""
+    def test_base_read_from_exposes_version_to_read_value(self):
+        """A scope built on PSBTScope.read_from must see the PSBT version.
+
+        read_value keeps its (stream, key) signature, so subclasses written
+        against it keep working; the version is scope state instead.
+        """
         from embit.psbt import PSBTScope
 
         seen = []
@@ -1385,9 +1389,9 @@ class TestBaseScopeVersion:
         class Scope(PSBTScope):
             V2_FIELDS = (b"\x0e",)
 
-            def read_value(self, stream, key, version=None):
-                seen.append((key, version))
-                super().read_value(stream, key, version=version)
+            def read_value(self, stream, key):
+                seen.append((key, self.version))
+                super().read_value(stream, key)
 
         raw = kv(b"\x0e", bytes(32)) + kv(b"\xf0", b"x") + b"\x00"
         scope = Scope.read_from(BytesIO(raw), version=2)
@@ -1398,3 +1402,110 @@ class TestBaseScopeVersion:
         assert seen == [(b"\xf0", None)]
         with pytest.raises(PSBTError):
             Scope.read_from(BytesIO(raw))
+
+    def test_read_value_signature_is_stream_and_key(self):
+        """A subclass overriding read_value(stream, k) must still parse."""
+        calls = []
+
+        class OldStyleInput(InputScope):
+            def read_value(self, stream, k):
+                calls.append(k)
+                return super().read_value(stream, k)
+
+        class OldStylePSBT(PSBT):
+            PSBTIN_CLS = OldStyleInput
+
+        psbt = OldStylePSBT.parse(a2b_base64(VIEW_PSBTS[1]))
+        assert psbt.version == 2
+        assert calls
+
+
+class TestHardeningRegressions:
+    """Regressions for the holes found reviewing this branch."""
+
+    def test_leaf_hash_count_is_bounded_by_the_value(self):
+        """A huge leaf hash count must be rejected without allocating for it."""
+        from embit.psbt import ser_string
+
+        xonly = unhexlify(
+            "f9308a019258c31049344f85f89d5229b531c845836f99b08601f113bce036f9"
+        )
+        for cls, key in ((InputScope, b"\x16"), (OutputScope, b"\x07")):
+            s = BytesIO()
+            # the whole value is the count: 5 bytes claiming 20M leaf hashes
+            ser_string(s, compact.to_bytes(20_000_000))
+            s.seek(0)
+            with pytest.raises(PSBTError):
+                cls().read_value(s, key + xonly)
+
+    def test_duplicate_keys_rejected_in_every_compress_mode(self):
+        raw = PSBT.parse(a2b_base64(VIEW_PSBTS[1])).serialize()
+        tx = PSBT.parse(raw).inputs[0].non_witness_utxo
+        entry = kv(b"\x00", tx.serialize())
+        i = raw.find(entry)
+        assert i >= 0
+        dup = raw[:i] + entry + raw[i:]
+        for mode in CompressMode.KEEP_ALL, CompressMode.CLEAR_ALL, CompressMode.PARTIAL:
+            with pytest.raises(PSBTError):
+                PSBT.parse(dup, compress=mode)
+        # PSBTView reads its utxos with PARTIAL internally
+        with pytest.raises(PSBTError):
+            PSBTView.view(BytesIO(dup))._utxo_values_and_scripts()
+
+    def test_duplicate_taproot_derivation_rejected(self):
+        raw = PSBT.parse(a2b_base64(VIEW_PSBTS[1])).serialize()
+        xonly = unhexlify(
+            "f9308a019258c31049344f85f89d5229b531c845836f99b08601f113bce036f9"
+        )
+        entry = kv(b"\x16" + xonly, b"\x00" + b"\xaa\xbb\xcc\xdd")
+        i = raw.find(kv(b"\x0e", bytes(reversed(PSBT.parse(raw).inputs[0].txid))))
+        assert i >= 0
+        with pytest.raises(PSBTError):
+            PSBT.parse(raw[:i] + entry + entry + raw[i:])
+
+    def test_out_of_range_output_index_raises_psbterror(self):
+        psbt = PSBT.parse(a2b_base64(VIEW_PSBTS[1]))
+        for inp in psbt.inputs:
+            inp.witness_utxo = None  # legacy input: only the non-witness utxo
+        psbt.inputs[0].vout = 99
+        raw = psbt.serialize()
+        with pytest.raises(PSBTError):
+            PSBT.parse(raw, compress=CompressMode.PARTIAL)
+        # KEEP_ALL used to parse and then raise IndexError on attribute access
+        parsed = PSBT.parse(raw)
+        for get in (
+            lambda: parsed.inputs[0].utxo,
+            lambda: parsed.inputs[0].script_pubkey,
+            lambda: parsed.inputs[0].is_taproot,
+            lambda: parsed.fee(),
+        ):
+            with pytest.raises(PSBTError):
+                get()
+        with pytest.raises(PSBTError):
+            PSBTView.view(BytesIO(raw)).input(0).utxo
+
+    def test_locktime_ranges_checked_on_write(self):
+        for field, value in (
+            ("required_height_locktime", 500000001),
+            ("required_height_locktime", 0),
+            ("required_time_locktime", 1),
+            ("required_time_locktime", 499999999),
+        ):
+            psbt = PSBT.parse(a2b_base64(VIEW_PSBTS[1]))
+            setattr(psbt.inputs[0], field, value)
+            with pytest.raises(PSBTError):
+                psbt.serialize()
+            with pytest.raises(PSBTError):
+                psbt.determine_locktime()
+
+    def test_explicit_global_version_zero_survives_round_trip(self):
+        raw = PSBT.parse(a2b_base64(VIEW_PSBTS[0])).serialize()
+        i = raw.find(b"psbt\xff") + 5
+        inj = raw[:i] + kv(b"\xfb", (0).to_bytes(4, "little")) + raw[i:]
+        psbt = PSBT.parse(inj)
+        assert psbt.version == 0
+        # the field used to be dropped, so it had to survive a re-serialize
+        out = psbt.serialize()
+        assert kv(b"\xfb", (0).to_bytes(4, "little")) in out
+        assert PSBT.parse(out).version == 0
+        assert PSBTView.view(BytesIO(inj)).version == 0
