@@ -727,6 +727,39 @@ class TestPSBTv2Compression:
         assert parsed.inputs[0]._utxo.value == 1234
         assert parsed.verify()
 
+    def test_psbtv2_compress_rejects_non_seekable_stream(self):
+        """Without seek the prescan can't find 0x0f, so compress must fail
+        instead of silently buffering the whole prev tx"""
+
+        class NoSeek:
+            def __init__(self, data):
+                self._s = BytesIO(data)
+
+            def read(self, n=-1):
+                return self._s.read(n)
+
+        prev = Transaction(
+            vin=[TransactionInput(bytes([1]) * 32, 0)],
+            vout=[TransactionOutput(1234, Script(b"\x51"))],
+        )
+        psbt = PSBT.create_v2()
+        inp = InputScope()
+        inp.txid = prev.txid()
+        inp.vout = 0
+        inp.non_witness_utxo = prev
+        psbt.add_input(inp)
+        out = OutputScope()
+        out.value = 1000
+        out.script_pubkey = Script(b"\x51")
+        psbt.add_output(out)
+        raw = psbt.serialize()
+
+        with pytest.raises(PSBTError):
+            PSBT.read_from(NoSeek(raw), compress=CompressMode.PARTIAL)
+        # without compress a non-seekable stream is fine
+        parsed = PSBT.read_from(NoSeek(raw))
+        assert parsed.inputs[0].non_witness_utxo.txid() == prev.txid()
+
 
 def kv(key, value):
     return compact.to_bytes(len(key)) + key + compact.to_bytes(len(value)) + value

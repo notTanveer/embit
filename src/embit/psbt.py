@@ -485,8 +485,14 @@ class InputScope(PSBTScope):
                     if self.vout is not None
                     else getattr(self, "_prescan_vout", None)
                 )
+                if self.compress and effective_vout is None:
+                    # don't silently buffer the whole tx when compress was asked for
+                    raise PSBTError(
+                        "PSBT_IN_OUTPUT_INDEX unknown before PSBT_IN_NON_WITNESS_UTXO, "
+                        "compressed parsing of PSBTv2 needs a seekable stream"
+                    )
                 # we verified and saved utxo
-                if self.compress and effective_vout is not None:
+                if self.compress:
                     txout, txhash = self.TX_CLS.read_vout(bounded, effective_vout)
                     self._txhash = txhash
                     self._utxo = txout
