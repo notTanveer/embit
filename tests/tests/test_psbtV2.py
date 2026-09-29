@@ -499,7 +499,7 @@ class TestPSBTv2Constructor:
         inp.vout = 0
         psbt.add_input(inp)
         assert len(psbt.inputs) == 1
-        assert psbt._raw_input_count_from_global == 1
+        assert len(PSBT.parse(psbt.serialize()).inputs) == 1
 
     def test_add_input_requires_inputs_modifiable(self):
         """add_input() raises when INPUTS bit is clear"""
@@ -580,7 +580,7 @@ class TestPSBTv2Constructor:
         out.script_pubkey = Script(b"\x00\x14" + bytes(20))
         psbt.add_output(out)
         assert len(psbt.outputs) == 1
-        assert psbt._raw_output_count_from_global == 1
+        assert len(PSBT.parse(psbt.serialize()).outputs) == 1
 
     def test_add_output_requires_outputs_modifiable(self):
         """add_output() raises when OUTPUTS bit is clear"""

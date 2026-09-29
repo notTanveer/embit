@@ -1764,8 +1764,6 @@ class PSBT(EmbitBase):
                 ):
                     raise PSBTError("New input changes the locktime of a signed PSBT")
         self.inputs.append(input_scope)
-        if self.version == 2:
-            self._raw_input_count_from_global = len(self.inputs)
 
     def add_output(self, output_scope):
         if not self.is_outputs_modifiable():
@@ -1773,5 +1771,3 @@ class PSBT(EmbitBase):
         if self.version == 2:
             self._validate_v2_output(output_scope, len(self.outputs))
         self.outputs.append(output_scope)
-        if self.version == 2:
-            self._raw_output_count_from_global = len(self.outputs)
