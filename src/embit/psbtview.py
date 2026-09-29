@@ -23,6 +23,7 @@ from . import ec
 from . import script
 from .script import Script, Witness
 from . import hashes
+from . import bip32
 from .psbt import (
     PSBT,
     PSBTError,
@@ -362,6 +363,14 @@ class PSBTView:
                         version = int.from_bytes(value, "little")
                 else:
                     value_len = read_compact(stream)
+                    if key[:1] == b"\x01":
+                        # same checks PSBT.parse does, without reading the value
+                        if value_len < 4 or value_len % 4:
+                            raise PSBTError("Invalid PSBT_GLOBAL_XPUB value length")
+                        try:
+                            bip32.HDKey.parse(key[1:])
+                        except _PARSE_ERRORS as e:
+                            raise PSBTError("Invalid PSBT_GLOBAL_XPUB: %s" % e)
                     header = len(compact.to_bytes(value_len))
                     deferred_kvs[key] = (cur + header, value_len)
                     skip_exact(stream, value_len)

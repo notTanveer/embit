@@ -933,6 +933,25 @@ class TestPSBTErrorHygiene:
         raw = raw_v2([V2_IN], [V2_OUT], extra_globals=kv(b"\x01" + bytes(78), bytes(4)))
         with pytest.raises(PSBTError):
             PSBT.parse(raw)
+        with pytest.raises(PSBTError):
+            _exercise_view(raw)
+
+    @pytest.mark.parametrize(
+        "value_len, valid", [(0, 0), (3, 0), (4, 1), (5, 0), (8, 1)]
+    )
+    def test_xpub_global_value_length(self, value_len, valid):
+        """fingerprint plus whole 4-byte path elements, same in both parsers"""
+        xpub = SIGNING_ROOT.to_public().serialize()
+        extra = kv(b"\x01" + xpub, bytes(value_len))
+        raw = raw_v2([V2_IN], [V2_OUT], extra_globals=extra)
+        if valid:
+            PSBT.parse(raw)
+            _exercise_view(raw)
+        else:
+            with pytest.raises(PSBTError):
+                PSBT.parse(raw)
+            with pytest.raises(PSBTError):
+                _exercise_view(raw)
 
     def test_corrupted_global_transaction(self):
         raw = a2b_base64(VIEW_PSBTS[0])

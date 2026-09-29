@@ -226,6 +226,8 @@ class DerivationPath(EmbitBase):
     @classmethod
     def read_from(cls, stream):
         fingerprint = stream.read(4)
+        if len(fingerprint) != 4:
+            raise PSBTError("Invalid length")
         derivation = []
         while True:
             r = stream.read(4)
