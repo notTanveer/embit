@@ -32,6 +32,8 @@ from .psbt import (
     OutputScope,
     LOCKTIME_THRESHOLD,
     choose_locktime,
+    derive_hdkey,
+    resolve_signing_root,
     next_tx_modifiable,
     read_string,
     ser_string,
@@ -1040,19 +1042,9 @@ class PSBTView:
         if i < 0 or i >= self.num_inputs:
             raise PSBTError("Invalid input number")
 
-        # if WIF - fingerprint is None
-        fingerprint = None
-        # if descriptor key
-        if hasattr(root, "origin"):
-            if not root.is_private:  # pubkey can't sign
-                return 0
-            if root.is_extended:  # use fingerprint only for HDKey
-                fingerprint = root.fingerprint
-            else:
-                root = root.key  # WIF key
-        # if HDKey
-        if not fingerprint and hasattr(root, "my_fingerprint"):
-            fingerprint = root.my_fingerprint
+        fingerprint, can_sign, root = resolve_signing_root(root)
+        if not can_sign:
+            return 0
 
         rootpub = root.get_public_key()
         sec = rootpub.sec()
@@ -1105,17 +1097,10 @@ class PSBTView:
         # get derived keys for signing
         derived_keypairs = OrderedDict()  # (prv, pub)
         for pub, derivation in bip32_derivations:
-            der = derivation.derivation
-            # descriptor key has origin derivation that we take into account
-            if hasattr(root, "origin"):
-                if root.origin:
-                    if root.origin.derivation != der[: len(root.origin.derivation)]:
-                        # derivation doesn't match - go to next input
-                        continue
-                    der = der[len(root.origin.derivation) :]
-                hdkey = root.key.derive(der)
-            else:
-                hdkey = root.derive(der)
+            hdkey = derive_hdkey(root, derivation)
+            if hdkey is None:
+                # derivation doesn't match - go to next candidate
+                continue
 
             if hdkey.xonly() != pub.xonly():
                 raise PSBTError("Derivation path doesn't look right")

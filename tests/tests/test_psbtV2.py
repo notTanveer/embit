@@ -1219,6 +1219,31 @@ class TestPSBTViewParity:
             view.write_to(out, extra_input_streams=streams)
             assert psbt.serialize() == out.getvalue()
 
+    def test_descriptor_key_signing_matches(self):
+        """origin prefix handling is shared between PSBT and PSBTView"""
+        from embit.descriptor.arguments import Key
+
+        fp = SIGNING_ROOT.my_fingerprint.hex()
+        keys = [
+            # origin matches the input derivations
+            "[%s/84h/1h/0h]%s" % (fp, SIGNING_ROOT.derive("m/84h/1h/0h").to_base58()),
+            # origin doesn't match, nothing to sign
+            "[%s/49h/1h/0h]%s" % (fp, SIGNING_ROOT.derive("m/49h/1h/0h").to_base58()),
+            # public key can't sign
+            SIGNING_ROOT.to_public().to_base58(),
+        ]
+        raw = a2b_base64(VIEW_PSBTS[1])
+        for key, expected in zip(keys, [3, 0, 0]):
+            key = Key.from_string(key)
+            psbt = PSBT.parse(raw)
+            assert psbt.sign_with(key) == expected
+            sigs = BytesIO()
+            assert PSBTView.view(BytesIO(raw)).sign_with(key, sigs) == expected
+            sigs.seek(0)
+            for inp in psbt.inputs:
+                signed = InputScope.read_from(sigs, version=psbt.version)
+                assert signed.partial_sigs == inp.partial_sigs
+
     def test_missing_utxo_is_psbterror(self):
         raw = a2b_base64(VIEW_PSBTS[1])
         psbt = PSBT.parse(raw)
