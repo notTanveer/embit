@@ -1367,6 +1367,33 @@ class TestBIP341Sighash:
             )
 
 
+# 3 inputs, 3 p2pkh outputs, digests from Bitcoin Core's
+# test_framework.script.LegacySignatureHash
+LEGACY_SINGLE_TX = "020000000333333333333333333333333333333333333333333333333333333333333333330000000000feffffff34343434343434343434343434343434343434343434343434343434343434340100000000feffffff35353535353535353535353535353535353535353535353535353535353535350200000000feffffff03409c0000000000001976a914111111111111111111111111111111111111111188ac419c0000000000001976a914111111111111111111111111111111111111111188ac429c0000000000001976a914111111111111111111111111111111111111111188ac00000000"
+LEGACY_SINGLE_SPK = "76a914111111111111111111111111111111111111111188ac"
+# (txinIndex, hashType, sigHash)
+LEGACY_SINGLE_SIGHASHES = [
+    (1, 0x03, "0920d13615abe92f406a236c982d7c8f5eead1206a96e4644be4b5f20e946db9"),
+    (1, 0x83, "e85a08f4d63396e3fcd3eb7f1c7249eebc3df5553d21a4abdc19d3e25a2528e2"),
+    (2, 0x03, "f6bd1d0591f174778887715da118a7a0b0f5f617c3b3241a98eb31d8a8406cd7"),
+    (2, 0x83, "72c85150138e76c6f66799b77f1cda132dcdbdd07aedd803efb3ddaf12f375a3"),
+]
+
+
+class TestLegacySighashSingle:
+    """SIGHASH_SINGLE blanks earlier outputs as CTxOut() with nValue = -1"""
+
+    @pytest.mark.parametrize("index, hash_type, expected", LEGACY_SINGLE_SIGHASHES)
+    def test_transaction_psbt_and_psbtview(self, index, hash_type, expected):
+        tx = Transaction.parse(unhexlify(LEGACY_SINGLE_TX))
+        spk = Script(unhexlify(LEGACY_SINGLE_SPK))
+        assert tx.sighash_legacy(index, spk, hash_type) == unhexlify(expected)
+        psbt = PSBT(tx)
+        assert psbt.sighash_legacy(index, spk, hash_type) == unhexlify(expected)
+        view = PSBTView.view(BytesIO(psbt.serialize()))
+        assert view.sighash_legacy(index, spk, hash_type) == unhexlify(expected)
+
+
 class TestZeroInputUnsignedTx:
     """BIP-174: the unsigned tx is non-witness serialized, so a PSBT whose
     transaction has no inputs yet starts its input count with a plain 0x00"""

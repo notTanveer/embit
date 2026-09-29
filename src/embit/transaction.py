@@ -333,7 +333,7 @@ class Transaction(EmbitBase):
         # one output on the same index, others are empty
         elif sh == SIGHASH.SINGLE:
             h.update(compact.to_bytes(input_index + 1))
-            empty = TransactionOutput(0xFFFFFFFF, Script(b"")).serialize()
+            empty = TransactionOutput(0xFFFFFFFFFFFFFFFF, Script(b"")).serialize()
             # this way we commit to input index
             for i in range(input_index):
                 h.update(empty)
