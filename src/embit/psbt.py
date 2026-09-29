@@ -829,6 +829,13 @@ class InputScope(PSBTScope):
                 break
             res._read_value_checked(stream, key, version=version)
         del res._prescan_vout
+        # compress mode checks this in read_vout, do the same for the full tx
+        if (
+            res.non_witness_utxo is not None
+            and res.vout is not None
+            and res.vout >= len(res.non_witness_utxo.vout)
+        ):
+            raise PSBTError("Invalid vout index %d" % res.vout)
         return res
 
 

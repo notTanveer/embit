@@ -1201,6 +1201,36 @@ class TestPSBTViewParity:
         with pytest.raises(PSBTError):
             PSBT.parse(raw).fee()
 
+    def test_output_index_past_non_witness_utxo_is_psbterror(self):
+        """KEEP_ALL used to accept it and then fail with IndexError when signing"""
+        prev = Transaction(
+            vin=[TransactionInput(bytes([1]) * 32, 0)],
+            vout=[TransactionOutput(1234, Script(b"\x51"))],
+        )
+        v0 = PSBT(
+            Transaction(
+                vin=[TransactionInput(prev.txid(), 5)],
+                vout=[TransactionOutput(1000, Script(b"\x51"))],
+            )
+        )
+        v0.inputs[0].non_witness_utxo = prev
+        v2 = PSBT.create_v2()
+        inp = InputScope()
+        inp.txid = prev.txid()
+        inp.vout = 5
+        inp.non_witness_utxo = prev
+        v2.add_input(inp)
+        out = OutputScope()
+        out.value = 1000
+        out.script_pubkey = Script(b"\x51")
+        v2.add_output(out)
+        for raw in (v0.serialize(), v2.serialize()):
+            for compress in (CompressMode.KEEP_ALL, CompressMode.PARTIAL):
+                with pytest.raises(PSBTError):
+                    PSBT.parse(raw, compress=compress)
+            with pytest.raises(PSBTError):
+                PSBTView.view(BytesIO(raw)).sign_with(SIGNING_ROOT, BytesIO())
+
 
 class TestNonWitnessUtxoLength:
     """The declared PSBT_IN_NON_WITNESS_UTXO length must match the transaction"""
