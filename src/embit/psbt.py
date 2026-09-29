@@ -1733,7 +1733,21 @@ class PSBT(EmbitBase):
                 input_scope.required_height_locktime is not None
                 or input_scope.required_time_locktime is not None
             ):
-                self._validate_locktime_compatibility(self.inputs + [input_scope])
+                inputs = self.inputs + [input_scope]
+                self._validate_locktime_compatibility(inputs)
+                # BIP-370: no locktime change once any input is signed
+                signed = any(
+                    inp.partial_sigs
+                    or inp.taproot_key_sig
+                    or inp.taproot_sigs
+                    or inp.final_scriptsig is not None
+                    or inp.final_scriptwitness is not None
+                    for inp in self.inputs
+                )
+                if signed and self.determine_locktime() != choose_locktime(
+                    *self._classify_locktimes(inputs), fallback=self.locktime or 0
+                ):
+                    raise PSBTError("New input changes the locktime of a signed PSBT")
         self.inputs.append(input_scope)
         if self.version == 2:
             self._raw_input_count_from_global = len(self.inputs)

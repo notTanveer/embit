@@ -526,6 +526,52 @@ class TestPSBTv2Constructor:
         with pytest.raises(PSBTError):
             psbt.add_input(inp)
 
+    @staticmethod
+    def _signed_v2(required_height=None):
+        """A PSBTv2 whose only input is signed with ALL|ANYONECANPAY,
+        so inputs stay modifiable"""
+        from embit.psbt import DerivationPath
+        from embit.script import p2wpkh
+
+        pub = SIGNING_ROOT.get_public_key()
+        psbt = PSBT.create_v2(fallback_locktime=0)
+        inp = InputScope()
+        inp.txid = bytes(32)
+        inp.vout = 0
+        inp.witness_utxo = TransactionOutput(100000, p2wpkh(pub))
+        inp.bip32_derivations[pub] = DerivationPath(SIGNING_ROOT.my_fingerprint, [])
+        inp.required_height_locktime = required_height
+        psbt.add_input(inp)
+        out = OutputScope()
+        out.value = 90000
+        out.script_pubkey = p2wpkh(pub)
+        psbt.add_output(out)
+        assert psbt.sign_with(SIGNING_ROOT, sighash=SIGHASH.ALL | SIGHASH.ANYONECANPAY)
+        assert psbt.is_inputs_modifiable()
+        return psbt
+
+    @staticmethod
+    def _input_with_height(height):
+        inp = InputScope()
+        inp.txid = bytes([1]) * 32
+        inp.vout = 0
+        inp.required_height_locktime = height
+        return inp
+
+    def test_add_input_rejects_locktime_change_after_signing(self):
+        """BIP-370: a new input must not change the locktime once inputs are signed"""
+        psbt = self._signed_v2()
+        with pytest.raises(PSBTError):
+            psbt.add_input(self._input_with_height(800000))
+        assert len(psbt.inputs) == 1
+        assert psbt.determine_locktime() == 0
+
+    def test_add_input_keeps_locktime_after_signing(self):
+        """an input that leaves the locktime as it is can still be added"""
+        psbt = self._signed_v2(required_height=800000)
+        psbt.add_input(self._input_with_height(700000))
+        assert psbt.determine_locktime() == 800000
+
     def test_add_output_appends_and_updates_count(self):
         """add_output() appends the scope and increments the global output count"""
         psbt = PSBT.create_v2()
