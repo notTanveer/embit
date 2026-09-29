@@ -148,6 +148,26 @@ class LiquidTest(TestCase):
         with self.assertRaises(PSBTError):
             view.hash_outputs()
 
+    def test_rangeproof_sighash_ignores_longer_unknown_keys(self):
+        """PSET keeps these keys as unknown, PSETView must not hash them as proofs"""
+        from embit.liquid.transaction import LSIGHASH
+
+        root = HDKey.from_string(SIGN_TPRV)
+        sighash = LSIGHASH.ALL | LSIGHASH.RANGEPROOF
+        for key in [b"\xfc\x04pset\x04\x00", b"\xfc\x04pset\x05\x00"]:
+            with self.subTest(key=key):
+                pset = PSET.from_string(SIGN_PSET_V2_B64)
+                pset.outputs[0].unknown[key] = b"not a proof"
+                raw = pset.serialize()
+                pset = PSET.parse(raw)
+                self.assertEqual(pset.sign_with(root, sighash=sighash), 1)
+                sigs = BytesIO()
+                view = PSETView.view(BytesIO(raw))
+                self.assertEqual(view.sign_with(root, sigs, sighash=sighash), 1)
+                sigs.seek(0)
+                signed = LInputScope.read_from(sigs, version=2)
+                self.assertEqual(signed.partial_sigs, pset.inputs[0].partial_sigs)
+
     def test_corrupted_global_transaction_is_psbterror(self):
         pset = PSET.from_string(PSET_V0_B64)
         raw = pset.serialize()

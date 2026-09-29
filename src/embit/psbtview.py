@@ -711,9 +711,9 @@ class PSBTView:
             self._tx_version = int.from_bytes(self._global_kvs[b"\x02"], "little")
         return self._tx_version
 
-    def seek_to_value(self, key_start, from_current=False):
+    def seek_to_value(self, key_start, from_current=False, exact=False):
         """
-        Seeks to value with key starting with key_start.
+        Seeks to value with key starting with key_start (equal to it if exact=True).
         Returns offset - relative if from_current=True, absolute otherwise.
         If key is not found - returns None.
         """
@@ -729,7 +729,7 @@ class PSBTView:
             if len(key) == 0:
                 return None
             # matches
-            if key.startswith(key_start):
+            if key == key_start if exact else key.startswith(key_start):
                 return off
             # continue to the next key
             off += skip_string(self.stream)

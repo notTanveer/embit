@@ -182,12 +182,12 @@ class PSETView(PSBTView):
             for i in range(self.num_outputs):
                 off = self.seek_to_scope(self.num_inputs + i)
                 rangeproof_offset = self.seek_to_value(
-                    b"\xfc\x04pset\x04", from_current=True
+                    b"\xfc\x04pset\x04", from_current=True, exact=True
                 )
                 if not rangeproof_offset:
                     self.stream.seek(off)
                     rangeproof_offset = self.seek_to_value(
-                        b"\xfc\x08elements\x04", from_current=True
+                        b"\xfc\x08elements\x04", from_current=True, exact=True
                     )
                 if not rangeproof_offset:
                     h.update(b"\x00")
@@ -198,12 +198,12 @@ class PSETView(PSBTView):
 
                 self.stream.seek(off)
                 surj_proof_offset = self.seek_to_value(
-                    b"\xfc\x04pset\x05", from_current=True
+                    b"\xfc\x04pset\x05", from_current=True, exact=True
                 )
                 if not surj_proof_offset:
                     self.stream.seek(off)
                     surj_proof_offset = self.seek_to_value(
-                        b"\xfc\x08elements\x05", from_current=True
+                        b"\xfc\x08elements\x05", from_current=True, exact=True
                     )
                 if not surj_proof_offset:
                     h.update(b"\x00")
