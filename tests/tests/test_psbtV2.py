@@ -965,6 +965,19 @@ class TestPSBTErrorHygiene:
         with pytest.raises(PSBTError):
             PSBTView.view(BytesIO(raw))
 
+    def test_huge_count_fails_on_the_first_empty_map(self):
+        """every 0x00 byte would become an InputScope if maps were only
+        validated after all of them were parsed"""
+        g = (
+            kv(b"\x02", (2).to_bytes(4, "little"))
+            + kv(b"\x04", compact.to_bytes(2**40))
+            + kv(b"\x05", compact.to_bytes(0))
+            + kv(b"\xfb", (2).to_bytes(4, "little"))
+        )
+        raw = PSBT.MAGIC + g + b"\x00" + b"\x00" * 100000
+        with pytest.raises(PSBTError, match="input 0 missing"):
+            PSBT.parse(raw)
+
     def test_corrupted_nested_value_reports_key(self):
         # bip32 derivation with a 1-byte pubkey in the key
         raw = raw_v2([V2_IN + kv(b"\x06\x02", bytes(8))], [V2_OUT])

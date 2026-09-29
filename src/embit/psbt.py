@@ -1351,35 +1351,25 @@ class PSBT(EmbitBase):
             num_inputs = psbt._raw_input_count_from_global
             num_outputs = psbt._raw_output_count_from_global
 
+            # validate each map as it is parsed, so a huge declared count
+            # fails on the first bad map instead of after allocating them all
             parsed_inputs = []
-            for _ in range(num_inputs):
-                parsed_inputs.append(
-                    cls.PSBTIN_CLS.read_from(
-                        stream,
-                        compress=compress,
-                        vin=None,
-                        version=version,
-                    )
+            for i in range(num_inputs):
+                inp = cls.PSBTIN_CLS.read_from(
+                    stream, compress=compress, vin=None, version=version
                 )
+                cls._validate_v2_input(inp, i)
+                parsed_inputs.append(inp)
             psbt.inputs = parsed_inputs
 
-            for i, inp in enumerate(psbt.inputs):
-                cls._validate_v2_input(inp, i)
-
             parsed_outputs = []
-            for _ in range(num_outputs):
-                parsed_outputs.append(
-                    cls.PSBTOUT_CLS.read_from(
-                        stream,
-                        compress=compress,
-                        vout=None,
-                        version=version,
-                    )
+            for i in range(num_outputs):
+                out = cls.PSBTOUT_CLS.read_from(
+                    stream, compress=compress, vout=None, version=version
                 )
-            psbt.outputs = parsed_outputs
-
-            for i, out in enumerate(psbt.outputs):
                 cls._validate_v2_output(out, i)
+                parsed_outputs.append(out)
+            psbt.outputs = parsed_outputs
         else:
             temp_inputs = []
             for i in range(len(psbt.inputs)):
