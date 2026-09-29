@@ -822,11 +822,17 @@ class InputScope(PSBTScope):
                         break
                     skip_string(stream)
                 stream.seek(start_pos)
+        # compress mode skips some values, so it can't rely on the
+        # per-field duplicate checks in read_value()
+        seen = set()
         while True:
             key = read_string(stream)
             # separator
             if len(key) == 0:
                 break
+            if key in seen:
+                raise PSBTError("Duplicated key")
+            seen.add(key)
             res._read_value_checked(stream, key, version=version)
         del res._prescan_vout
         # compress mode checks this in read_vout, do the same for the full tx
@@ -1011,11 +1017,15 @@ class OutputScope(PSBTScope):
     @classmethod
     def read_from(cls, stream, compress=CompressMode.KEEP_ALL, vout=None, version=None):
         res = cls({}, vout=vout, compress=compress)
+        seen = set()
         while True:
             key = read_string(stream)
             # separator
             if len(key) == 0:
                 break
+            if key in seen:
+                raise PSBTError("Duplicated key")
+            seen.add(key)
             res._read_value_checked(stream, key, version=version)
         return res
 
