@@ -576,6 +576,17 @@ class SilentPaymentsPSBT(PSBT):
 
         return priv_keys
 
+    def sp_output_scripts(self, root) -> dict:
+        """{output index: Script} of every Silent Payment output, derived from
+        ``root`` without writing anything to the PSBT.
+
+        Lets a signer show the taproot outputs for review before it signs. No
+        DLEQ proof is generated, so following this with sign_with() does not
+        pay for the proofs twice. Raises SPValidationError where
+        derive_sp_outputs() would.
+        """
+        return self._derive_sp(self._resolve_sp_privkeys(_signers(root)))[0]
+
     def derive_sp_outputs_from_keys(self, priv_keys, aux_rand=None) -> None:
         """Derive the Silent Payment outputs from explicit private scalars.
 
@@ -583,36 +594,7 @@ class SilentPaymentsPSBT(PSBT):
         shares, global DLEQ proofs - must agree with the derivation, otherwise
         SPValidationError is raised and the PSBT is left untouched.
         """
-        # validate_sp() is a no-op outside v2, and _write_extra_globals() drops
-        # the shares it would produce, so a v0 PSBT has to fail here rather
-        # than derive into fields that are silently thrown away on serialize.
-        if self.version != 2:
-            raise SPValidationError("Silent Payment signing requires PSBTv2")
-        self.validate_sp()
-
-        if not self.has_sp_outputs:
-            raise SPValidationError(
-                "Silent Payment send requires at least one output with "
-                "PSBT_OUT_SP_V0_INFO."
-            )
-        if not priv_keys:
-            raise SPValidationError(
-                "Silent Payment send requires at least one eligible input "
-                "(P2PKH, P2SH-P2WPKH, P2WPKH, or P2TR)."
-            )
-
-        scan_spend_groups, output_indices = group_sp_outputs_by_scan_key(self.outputs)
-
-        derivation = derive_sp_outputs(
-            priv_keys, [inp.vin for inp in self.inputs], scan_spend_groups
-        )
-        if derivation is None:
-            raise SPValidationError(
-                "Silent Payment signing failed: private key sum is zero."
-            )
-
-        a_sum_bytes, A_sum_sec, results = derivation
-        scripts = self._verify_declared_sp(A_sum_sec, results, output_indices)
+        scripts, a_sum_bytes, results, scan_spend_groups = self._derive_sp(priv_keys)
         # Every proof is generated before anything is written: compute_dleq_proof
         # raises on bad aux_rand, and a half-applied derivation leaves shares
         # without their proofs - a state validate_sp() rejects forever, so the
@@ -645,6 +627,45 @@ class SilentPaymentsPSBT(PSBT):
         # Inputs Modifiable and Outputs Modifiable.
         if self.tx_modifiable_flags is not None:
             self.tx_modifiable_flags &= ~(TxModifiable.INPUTS | TxModifiable.OUTPUTS)
+
+    def _derive_sp(self, priv_keys):
+        """The checked derivation behind sp_output_scripts() and
+        derive_sp_outputs_from_keys(). Writes nothing to the PSBT.
+
+        Returns (scripts, a_sum_bytes, results, scan_spend_groups), with
+        scripts as {output index: Script}.
+        """
+        # validate_sp() is a no-op outside v2, and _write_extra_globals() drops
+        # the shares it would produce, so a v0 PSBT has to fail here rather
+        # than derive into fields that are silently thrown away on serialize.
+        if self.version != 2:
+            raise SPValidationError("Silent Payment signing requires PSBTv2")
+        self.validate_sp()
+
+        if not self.has_sp_outputs:
+            raise SPValidationError(
+                "Silent Payment send requires at least one output with "
+                "PSBT_OUT_SP_V0_INFO."
+            )
+        if not priv_keys:
+            raise SPValidationError(
+                "Silent Payment send requires at least one eligible input "
+                "(P2PKH, P2SH-P2WPKH, P2WPKH, or P2TR)."
+            )
+
+        scan_spend_groups, output_indices = group_sp_outputs_by_scan_key(self.outputs)
+
+        derivation = derive_sp_outputs(
+            priv_keys, [inp.vin for inp in self.inputs], scan_spend_groups
+        )
+        if derivation is None:
+            raise SPValidationError(
+                "Silent Payment signing failed: private key sum is zero."
+            )
+
+        a_sum_bytes, A_sum_sec, results = derivation
+        scripts = self._verify_declared_sp(A_sum_sec, results, output_indices)
+        return scripts, a_sum_bytes, results, scan_spend_groups
 
     def _verify_declared_sp(self, A_sum_sec, results, output_indices):
         """Check the derivation against whatever this PSBT already declares.
