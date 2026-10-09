@@ -853,6 +853,17 @@ class TestSpendFromSP(unittest.TestCase):
         A = ec.PublicKey.from_xonly(output_xonly)
         self.assertTrue(dleq.verify_dleq_proof(A.sec(), sk, share, proof))
 
+    def test_spend_derivation_key_must_be_a_point(self):
+        """PSBT_IN_SP_SPEND_BIP32_DERIVATION keydata is a 33-byte pubkey."""
+        root = _root()
+        inp, _, _ = self._input(root, bytes([0x11] * 32))
+        inp.sp_spend_bip32_derivations = {
+            b"\x05" + bytes(32): DerivationPath(root.my_fingerprint, [0, 0])
+        }
+        psbt = self._dest_psbt(root, inp)
+        with self.assertRaises(ec.ECError):
+            PSBT.parse(psbt.serialize())
+
 
 class TestSPOutputTaprootInternalKey(unittest.TestCase):
     """

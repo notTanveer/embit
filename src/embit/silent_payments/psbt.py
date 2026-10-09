@@ -151,6 +151,7 @@ class SPInputScope(InputScope):
             if len(k) != 34:
                 raise PSBTError("Invalid PSBT_IN_SP_SPEND_BIP32_DERIVATION key length")
             pub_bytes = k[1:]
+            ec.PublicKey.parse(pub_bytes)  # kept as bytes, but must be a point
             if pub_bytes in self.sp_spend_bip32_derivations:
                 raise PSBTError(
                     "Duplicated PSBT_IN_SP_SPEND_BIP32_DERIVATION for pubkey"
