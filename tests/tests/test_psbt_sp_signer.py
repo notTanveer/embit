@@ -491,6 +491,27 @@ class TestInputEligibility(unittest.TestCase):
         with self.assertRaises(SPValidationError):
             psbt.sign_with(root)
 
+    def test_uncompressed_p2pkh_key_is_refused(self):
+        """BIP-352 only counts compressed keys, so the receiver would skip this
+        input and never find the output."""
+        from embit.script import p2pkh
+
+        key = ec.PrivateKey(bytes([7] * 32), compressed=False)
+        scan, spend = _sp_keys(self.SCAN_HEX, self.SPEND_HEX)
+        psbt = PSBT.create_v2()
+        inp = InputScope()
+        inp.txid = bytes([3] * 32)
+        inp.vout = 0
+        inp.witness_utxo = TransactionOutput(100_000, p2pkh(key.get_public_key()))
+        psbt.add_input(inp)
+        out = OutputScope()
+        out.value = 90_000
+        out.sp_data = SilentPaymentData(scan, spend)
+        psbt.add_output(out)
+        with self.assertRaises(SPValidationError):
+            psbt.sign_with(key, aux_rand=bytes(32))
+        self.assertIsNone(psbt.outputs[0].script_pubkey)
+
 
 class TestSignerBIP375Constraints(unittest.TestCase):
     """Signer-side BIP-375 constraints."""

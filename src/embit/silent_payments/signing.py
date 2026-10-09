@@ -129,7 +129,9 @@ def _resolve_bip32_privkey(inp, root, fingerprint, derive_hdkey):
             return hdkey.key.secret
 
     if fingerprint is None and hasattr(root, "secret"):
-        if pkh == hash160(root.get_public_key().sec()):
+        pub = root.get_public_key()
+        # BIP-352 only counts compressed keys: the receiver would skip this input
+        if pub.compressed and pkh == hash160(pub.sec()):
             return root.secret
     return None
 
