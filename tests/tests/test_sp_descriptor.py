@@ -187,6 +187,33 @@ class TestTwoArgDescriptor(TestCase):
             self.assertEqual(desc.get_scan_privkey().secret, scan_priv.secret)
             self.assertEqual(desc.get_spend_pubkey().sec(), spend_pub.sec())
 
+    def test_two_arg_derivation_suffix_is_applied(self):
+        """BIP-392 example form: account-level keys with /1h/0 and /0 suffixes."""
+        for v in VECTORS:
+            scan_priv, spend_priv = _derive_sp_keys(v["mnemonic"], v["coin_type"])
+            master = bip32.HDKey.from_seed(bip39.mnemonic_to_seed(v["mnemonic"]))
+            account = master.derive("m/352h/%dh/0h" % v["coin_type"])
+            desc = SilentPaymentDescriptor.from_string(
+                "sp(%s/1h/0,%s/0)"
+                % (account.to_base58(), account.derive("m/0h").to_public().to_base58())
+            )
+            self.assertEqual(desc.get_scan_privkey().secret, scan_priv.secret)
+            self.assertEqual(desc.get_spend_pubkey(), spend_priv.get_public_key())
+
+    def test_wildcard_and_multipath_keys_rejected(self):
+        """BIP-392: each sp() argument represents a single key."""
+        scan_hd, _, spend_hd_pub = self._leaf_hdkeys(VECTORS[0])
+        for scan_suffix, spend_suffix in (("/*", ""), ("", "/*"), ("/<0;1>", "")):
+            desc_str = "sp(%s%s,%s%s)" % (
+                scan_hd.to_base58(),
+                scan_suffix,
+                spend_hd_pub.to_base58(),
+                spend_suffix,
+            )
+            self.assertRaises(
+                DescriptorError, SilentPaymentDescriptor.from_string, desc_str
+            )
+
 
 class TestChecksumHandling(TestCase):
     """Descriptor #checksum suffix is stripped during parsing."""
@@ -283,6 +310,15 @@ class TestInvalidDescriptor(TestCase):
         scan_priv = ec.PrivateKey(bytes([0x01] * 32), compressed=False)
         spend_pub = self._spend_pub()
         desc_str = "sp(%s,%s)" % (scan_priv.wif(), hexlify(spend_pub.sec()).decode())
+        self.assertRaises(
+            DescriptorError, SilentPaymentDescriptor.from_string, desc_str
+        )
+
+    def test_uncompressed_spend_pubkey_rejected(self):
+        """BIP-392: uncompressed keys are not allowed under any sp() expression."""
+        spend_pub = ec.PrivateKey(bytes([0x02] * 32), compressed=False).get_public_key()
+        # str() of a PublicKey is its hex serialization
+        desc_str = "sp(%s,%s)" % (self._scan_priv().wif(), spend_pub)
         self.assertRaises(
             DescriptorError, SilentPaymentDescriptor.from_string, desc_str
         )

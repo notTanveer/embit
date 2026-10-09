@@ -127,6 +127,14 @@ class SilentPaymentDescriptor(DescriptorBase):
         elif scan_key is not None:
             if not _is_private_key(scan_key):
                 raise DescriptorError("Two-arg sp(): scan key must be private")
+            for k in (scan_key, spend_key):
+                if not isinstance(k, Key):
+                    continue
+                if not k.get_public_key().compressed:
+                    raise DescriptorError("Uncompressed keys are not allowed in sp()")
+                # BIP-392: each argument "represents a single key"
+                if k.is_wildcard or k.num_branches > 1:
+                    raise DescriptorError("sp() keys cannot be wildcard or multipath")
             self.sp_key = None
             self.scan_key = scan_key
             self.spend_key = spend_key
@@ -154,7 +162,8 @@ class SilentPaymentDescriptor(DescriptorBase):
             return self.sp_key.scan_privkey
         k = self.scan_key
         if isinstance(k, Key):
-            return k.private_key
+            # derive(0) applies a fixed suffix such as /1h/0; __init__ rejects wildcards
+            return k.derive(0).private_key
         return None
 
     def get_spend_pubkey(self):
@@ -162,7 +171,7 @@ class SilentPaymentDescriptor(DescriptorBase):
             return self.sp_key.spend_pubkey
         k = self.spend_key
         if isinstance(k, Key):
-            return k.get_public_key()
+            return k.derive(0).get_public_key()
         return None
 
     @classmethod
@@ -204,17 +213,9 @@ class SilentPaymentDescriptor(DescriptorBase):
             )
 
         scan_key = first_arg
-        if not _is_private_key(scan_key):
-            raise DescriptorError("Two-arg sp(): scan key must be private")
-        if isinstance(scan_key.key, ec.PrivateKey) and not scan_key.key.compressed:
-            raise DescriptorError("Uncompressed keys are not allowed in sp()")
-
         spend_arg = _read_sp_key_expression(s)
         if isinstance(spend_arg, SPScanKey):
             raise DescriptorError("Two-arg sp() cannot use spscan key expressions")
-        if isinstance(spend_arg, Key) and isinstance(spend_arg.key, ec.PrivateKey):
-            if not spend_arg.key.compressed:
-                raise DescriptorError("Uncompressed keys are not allowed in sp()")
 
         return cls(scan_key=scan_key, spend_key=spend_arg)
 
