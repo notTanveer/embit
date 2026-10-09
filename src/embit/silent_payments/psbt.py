@@ -293,14 +293,12 @@ class SilentPaymentsPSBT(PSBT):
         # add_output()/PSBTOUT_CLS guarantee every output is an SPOutputScope.
         return any(out.sp_data is not None for out in self.outputs)
 
-    @classmethod
-    def _v2_output_has_script(cls, out):
+    def _v2_output_has_script(self, out):
         """An SP output may omit PSBT_OUT_SCRIPT: the taproot script is derived
         from the ECDH shares, not known up front."""
         return out.script_pubkey is not None or out.sp_data is not None
 
-    @classmethod
-    def _validate_v2_output(cls, out, i):
+    def _validate_v2_output(self, out, i):
         """PSBT._validate_v2_output plus the SP label rule. Used by both the
         parser and add_output() (see base PSBT.add_output)."""
         super()._validate_v2_output(out, i)

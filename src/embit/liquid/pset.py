@@ -503,8 +503,7 @@ class PSET(PSBT):
     PSBTOUT_CLS = LOutputScope
     TX_CLS = LTransaction
 
-    @classmethod
-    def _v2_output_has_amount(cls, out):
+    def _v2_output_has_amount(self, out):
         """PSET allows value_commitment as an alternative to value (blinded outputs)."""
         return out.value is not None or out.value_commitment is not None
 

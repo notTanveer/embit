@@ -950,10 +950,8 @@ class PSBT(EmbitBase):
     PSBTOUT_CLS = OutputScope
     TX_CLS = Transaction
 
-    @classmethod
-    def _validate_v2_input(cls, inp, i):
-        """Check that a PSBTv2 input has all required fields.
-        Subclasses may override this to add extra validation."""
+    def _validate_v2_input(self, inp, i):
+        """Check that a PSBTv2 input has all required fields."""
         if inp.txid is None:
             raise PSBTError(
                 "PSBTv2 input %d missing required PSBT_IN_PREVIOUS_TXID (0x0e)" % i
@@ -963,25 +961,24 @@ class PSBT(EmbitBase):
                 "PSBTv2 input %d missing required PSBT_IN_OUTPUT_INDEX (0x0f)" % i
             )
 
-    @classmethod
-    def _v2_output_has_amount(cls, out):
+    # Instance methods, not classmethods: subclasses extend them with super(),
+    # and MicroPython binds super() in a classmethod to `type`.
+    def _v2_output_has_amount(self, out):
         """Subclasses (e.g. PSET) may override to accept alternative amount fields."""
         return out.value is not None
 
-    @classmethod
-    def _v2_output_has_script(cls, out):
+    def _v2_output_has_script(self, out):
         """Subclasses (e.g. SilentPaymentsPSBT) may override to accept a
         stand-in for PSBT_OUT_SCRIPT."""
         return out.script_pubkey is not None
 
-    @classmethod
-    def _validate_v2_output(cls, out, i):
+    def _validate_v2_output(self, out, i):
         """Check that a PSBTv2 output has all required fields."""
-        if not cls._v2_output_has_amount(out):
+        if not self._v2_output_has_amount(out):
             raise PSBTError(
                 "PSBTv2 output %d missing required PSBT_OUT_AMOUNT (0x03)" % i
             )
-        if not cls._v2_output_has_script(out):
+        if not self._v2_output_has_script(out):
             raise PSBTError(
                 "PSBTv2 output %d missing required PSBT_OUT_SCRIPT (0x04)" % i
             )
@@ -1210,13 +1207,13 @@ class PSBT(EmbitBase):
                 inp = cls.PSBTIN_CLS.read_from(
                     stream, compress=compress, version=version
                 )
-                cls._validate_v2_input(inp, i)
+                psbt._validate_v2_input(inp, i)
                 psbt.inputs.append(inp)
             for i in range(num_outputs):
                 out = cls.PSBTOUT_CLS.read_from(
                     stream, compress=compress, version=version
                 )
-                cls._validate_v2_output(out, i)
+                psbt._validate_v2_output(out, i)
                 psbt.outputs.append(out)
         else:  # PSBTv0 (version is None or 0)
             tx_bytes = global_kvs.pop(b"\x00")  # Remove so it's not in unknown
