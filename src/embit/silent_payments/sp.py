@@ -5,6 +5,8 @@ derivation, and PSBT input/output helpers.
 see: https://github.com/bitcoin/bips/blob/master/bip-0352.mediawiki
 """
 
+from collections import OrderedDict
+
 from .. import bech32, ec
 from ..hashes import tagged_hash
 from ..script import p2sh
@@ -176,7 +178,7 @@ def derive_sp_outputs(priv_keys, outpoints, scan_spend_groups):
 
     input_hash = get_input_hash(outpoints, A_sum_sec)
 
-    results = {}
+    results = OrderedDict()
     for sk_bytes, (scan_key, spend_keys) in scan_spend_groups.items():
         # one buffer for both multiplications: a_sum*B_scan is the ECDH share,
         # times input_hash it is the shared secret
@@ -317,7 +319,9 @@ def group_sp_outputs_by_scan_key(outputs):
     (BIP-375 k ordering).
     Returns ({scan_key_bytes: (scan_key, [spend_key, ...])},
              {scan_key_bytes: [out_idx, ...]})."""
-    groups = {}
+    # OrderedDict: MicroPython dicts are unordered, and the global shares and
+    # proofs are written in this order
+    groups = OrderedDict()
     for out_idx, out in enumerate(outputs):
         if out.sp_data is None:
             continue
@@ -326,7 +330,7 @@ def group_sp_outputs_by_scan_key(outputs):
             groups[sk_bytes] = (out.sp_data.scan_key, [])
         # the sort key is serialized once per output, rather than on every comparison
         groups[sk_bytes][1].append((out.sp_data.spend_key.sec(), out_idx))
-    scan_spend_groups = {}
+    scan_spend_groups = OrderedDict()
     output_indices = {}
     for sk_bytes, (scan_key, entries) in groups.items():
         entries.sort()

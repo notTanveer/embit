@@ -1122,6 +1122,22 @@ class TestGlobalSPFieldParsing(unittest.TestCase):
         with self.assertRaises(PSBTError):
             PSBT.parse(psbt.serialize())
 
+    def test_global_fields_follow_output_order(self):
+        """Shares and proofs are written in the order their scan keys first
+        appear in the outputs, on every runtime (MicroPython dicts are unordered)."""
+        root = _root()
+        psbt, _ = _make_p2wpkh_psbt(root, *_sp_keys(self.SCAN_HEX, self.SPEND_HEX))
+        scans = [root.derive([5, j]).get_public_key() for j in range(4)]
+        for scan in scans:
+            out = OutputScope()
+            out.value = 1_000
+            out.sp_data = SilentPaymentData(scan, scan)
+            psbt.add_output(out)
+        psbt.sign_with(root, aux_rand=bytes(32))
+        expected = [psbt.outputs[0].sp_data.scan_key.sec()] + [s.sec() for s in scans]
+        self.assertEqual(list(psbt.sp_ecdh_shares), expected)
+        self.assertEqual(list(psbt.sp_dleq_proofs), expected)
+
 
 class TestDeriveSPOutputsPreconditions(unittest.TestCase):
     """derive_sp_outputs_from_keys() is public and documented to leave the
