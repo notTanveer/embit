@@ -18,7 +18,6 @@ sign_with().
 import json
 import unittest
 from binascii import unhexlify
-from pathlib import Path
 
 from embit import ec
 from embit.base import EmbitError
@@ -28,7 +27,10 @@ from embit.silent_payments import (
     get_eligible_inputs,
 )
 
-_VECTOR_FILE = Path(__file__).parent / "data" / "bip375_test_vectors.json"
+# no pathlib/os.path on MicroPython
+_VECTOR_FILE = (
+    __file__.replace("\\", "/").rsplit("/", 1)[0] + "/data/bip375_test_vectors.json"
+)
 
 # These vectors are invalid because of a per-input DLEQ proof. Those fields are
 # validated structurally on parse but never verified: BIP-375 only asks a Signer
@@ -83,7 +85,7 @@ class TestBIP375Vectors(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        with _VECTOR_FILE.open(encoding="utf-8") as fh:
+        with open(_VECTOR_FILE) as fh:
             cls.vectors = json.load(fh)
 
     def test_valid_vectors_pass_validation(self):

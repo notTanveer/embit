@@ -7,7 +7,6 @@ from binascii import hexlify, unhexlify
 from unittest import TestCase
 
 import json
-import os
 
 from embit import hashes
 from embit.base import EmbitError
@@ -71,7 +70,7 @@ def get_input_pubkey(prevout_script, script_sig=None, witness=None) -> ECPubKey:
 
     if isinstance(script_sig, str):
         try:
-            ss = bytes.fromhex(script_sig)
+            ss = unhexlify(script_sig)
         except Exception:
             ss = b""
     elif isinstance(script_sig, bytes):
@@ -219,12 +218,8 @@ class SilentPaymentsTest(TestCase):
 
     def test_create_silent_payments_outputs(self):
         """Test silent payment output generation using test vectors"""
-        __location__ = os.path.realpath(
-            os.path.join(os.getcwd(), os.path.dirname(__file__))
-        )
-        with open(
-            os.path.join(__location__, "data/bip352_send_test_vectors.json"), "r"
-        ) as f:
+        path = __file__.replace("\\", "/").rsplit("/", 1)[0]
+        with open(path + "/data/bip352_send_test_vectors.json") as f:
             SEND_AND_RECEIVE_TEST_VECTORS = json.load(f)
 
         from io import BytesIO
@@ -251,7 +246,7 @@ class SilentPaymentsTest(TestCase):
                     witness = None
                     if wit_hex:
                         try:
-                            witness = Witness.read_from(BytesIO(bytes.fromhex(wit_hex)))
+                            witness = Witness.read_from(BytesIO(unhexlify(wit_hex)))
                         except Exception:
                             witness = None
 

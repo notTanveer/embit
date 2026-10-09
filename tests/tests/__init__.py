@@ -15,6 +15,10 @@ from .test_script import *
 from .test_bip85 import *
 from .test_taptree import *
 from .test_finalizer import *
+from .test_bip375 import *
+from .test_sp import *
+from .test_sp_descriptor import *
+from .test_psbt_sp_signer import *
 
 if sys.implementation.name != "micropython":
     from .test_ecdh import *

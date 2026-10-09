@@ -6,7 +6,7 @@ from embit.descriptor.errors import DescriptorError
 from embit import bip32, bip39, ec
 from embit.psbt import resolve_signing_root
 from embit.silent_payments import SilentPaymentsPSBT
-from binascii import unhexlify
+from binascii import hexlify, unhexlify
 
 # TODO: add more test vectors
 VECTORS = [
@@ -253,7 +253,10 @@ class TestInvalidDescriptor(TestCase):
         """Two-arg sp(pubkey_hex, pubkey_hex) is rejected - scan key must be private."""
         scan_pub = self._scan_priv().get_public_key()
         spend_pub = self._spend_pub()
-        desc_str = "sp(%s,%s)" % (scan_pub.sec().hex(), spend_pub.sec().hex())
+        desc_str = "sp(%s,%s)" % (
+            hexlify(scan_pub.sec()).decode(),
+            hexlify(spend_pub.sec()).decode(),
+        )
         self.assertRaises(
             DescriptorError, SilentPaymentDescriptor.from_string, desc_str
         )
@@ -279,7 +282,7 @@ class TestInvalidDescriptor(TestCase):
         """Uncompressed private key as scan arg is rejected."""
         scan_priv = ec.PrivateKey(bytes([0x01] * 32), compressed=False)
         spend_pub = self._spend_pub()
-        desc_str = "sp(%s,%s)" % (scan_priv.wif(), spend_pub.sec().hex())
+        desc_str = "sp(%s,%s)" % (scan_priv.wif(), hexlify(spend_pub.sec()).decode())
         self.assertRaises(
             DescriptorError, SilentPaymentDescriptor.from_string, desc_str
         )

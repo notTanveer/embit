@@ -22,7 +22,18 @@ class AssertRaisesContext:
         return False
 
 
+class _SubTest:
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
 class TestCase:
+    def subTest(self, msg=None, **params):
+        return _SubTest()
+
     def fail(self, msg=""):
         assert False, msg
 
@@ -189,6 +200,7 @@ class TestResult:
 
 # TODO: Uncompliant
 def run_class(c, test_result):
+    getattr(c, "setUpClass", lambda: None)()
     o = c()
     set_up = getattr(o, "setUp", lambda: None)
     tear_down = getattr(o, "tearDown", lambda: None)
