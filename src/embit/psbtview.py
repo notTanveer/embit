@@ -675,12 +675,12 @@ class PSBTView:
                     inp = self.PSBTIN_CLS.read_from(
                         self.stream,
                         vin=vin,
-                        compress=CompressMode.PARTIAL,
+                        compress=self.compress,
                         version=self.version,
                     )
                     off = self.stream.seek(0, 1)
                 else:
-                    inp = self.input(i, compress=CompressMode.PARTIAL)
+                    inp = self.input(i, compress=self.compress)
                 if inp.utxo is None:
                     raise PSBTError("Missing previous utxo on input %d" % i)
                 values.append(inp.utxo.value)
